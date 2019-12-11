@@ -1,5 +1,5 @@
 mod err;
-mod mft;
+mod journal;
 mod privileges;
 mod volumes;
 
@@ -23,8 +23,8 @@ fn main() {
 
             match volume.get_handle() {
                 Ok(handle) => {
-                    println!("Counting MFT entries...");
-                    let mft_iter = mft::MftEntryIterator::new(handle);
+                    println!("Counting journal entries...");
+                    let mft_iter = journal::JournalEntryIterator::new(handle);
 
                     let mut count = 0;
                     let time_taken = chrono::Duration::span(|| {

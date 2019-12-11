@@ -12,7 +12,10 @@ use winapi::{
         minwinbase::SYSTEMTIME,
         timezoneapi::FileTimeToSystemTime,
         winioctl::FSCTL_ENUM_USN_DATA,
-        winnt::{DWORDLONG, FILE_ID_128, LARGE_INTEGER, LONGLONG, USN, WCHAR},
+        winnt::{
+            DWORDLONG, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_ATTRIBUTE_TEMPORARY, FILE_ID_128, LARGE_INTEGER, LONGLONG, USN, WCHAR,
+        },
     },
 };
 
@@ -24,6 +27,36 @@ use std::{
     os::windows::ffi::OsStringExt as _,
     ptr,
 };
+
+// Shockingly, these are  not defined in winapi!
+#[repr(C)]
+#[allow(non_snake_case)]
+struct MFT_ENUM_DATA_V1 {
+    StartFileReferenceNumber: DWORDLONG,
+    LowUsn: USN,
+    HighUsn: USN,
+    MinMajorVersion: WORD,
+    MaxMajorVersion: WORD,
+}
+// Never actually constructed; we just need it for size_of.
+#[repr(C)]
+#[allow(non_snake_case)]
+struct USN_RECORD_V3 {
+    RecordLength: DWORD,
+    MajorVersion: WORD,
+    MinorVersion: WORD,
+    FileReferenceNumber: FILE_ID_128,
+    ParentFileReferenceNumber: FILE_ID_128,
+    Usn: USN,
+    TimeStamp: LARGE_INTEGER,
+    Reason: DWORD,
+    SourceInfo: DWORD,
+    SecurityId: DWORD,
+    FileAttributes: DWORD,
+    FileNameLength: WORD,
+    FileNameOffset: WORD,
+    FileName: [WCHAR; 1],
+}
 
 fn parse_time(time: LARGE_INTEGER) -> Result<DateTime<Utc>, Error> {
     let ftime = FILETIME {
@@ -53,44 +86,33 @@ fn parse_time(time: LARGE_INTEGER) -> Result<DateTime<Utc>, Error> {
     local_result.single().ok_or(Error::InvalidTimeRepr)
 }
 
-// shockingly, these are not defined in winapi
-#[repr(C)]
-#[allow(non_snake_case)]
-struct MFT_ENUM_DATA_V1 {
-    StartFileReferenceNumber: DWORDLONG,
-    LowUsn: USN,
-    HighUsn: USN,
-    MinMajorVersion: WORD,
-    MaxMajorVersion: WORD,
+fn is_flag_set(data: DWORD, flag: DWORD) -> bool {
+    (data & flag) != 0
 }
-#[repr(C)]
-#[allow(non_snake_case)]
-struct USN_RECORD_V3 {
-    RecordLength: DWORD,
-    MajorVersion: WORD,
-    MinorVersion: WORD,
-    FileReferenceNumber: FILE_ID_128,
-    ParentFileReferenceNumber: FILE_ID_128,
-    Usn: USN,
-    TimeStamp: LARGE_INTEGER,
-    Reason: DWORD,
-    SourceInfo: DWORD,
-    SecurityId: DWORD,
-    FileAttributes: DWORD,
-    FileNameLength: WORD,
-    FileNameOffset: WORD,
-    FileName: [WCHAR; 1],
+
+#[derive(Debug)]
+pub struct JournalEntry {
+    pub file_ref_number: u128,
+    pub parent_file_ref_number: u128,
+    pub usn: USN,
+    pub timestamp: DateTime<Utc>,
+    pub is_directory: bool,
+    pub is_reparse_point: bool,
+    pub is_temporary: bool,
+    pub filename: OsString,
 }
-impl USN_RECORD_V3 {
-    #[allow(non_snake_case)]
-    fn from_bytes(mut buf: &[u8]) -> Self {
-        let RecordLength = DWORD::from_le_bytes(buf[..mem::size_of::<DWORD>()].try_into().unwrap());
+impl JournalEntry {
+    #[allow(non_snake_case)] // to match what the Windows API provides
+    fn parse_usn_entry(mut buf: &[u8]) -> Result<Self, Error> {
+        let orig_buf = buf;
+
+        //let RecordLength = DWORD::from_le_bytes(buf[..mem::size_of::<DWORD>()].try_into().unwrap());
         buf = &buf[mem::size_of::<DWORD>()..];
 
         let MajorVersion = WORD::from_le_bytes(buf[..mem::size_of::<WORD>()].try_into().unwrap());
         buf = &buf[mem::size_of::<WORD>()..];
 
-        let MinorVersion = WORD::from_le_bytes(buf[..mem::size_of::<WORD>()].try_into().unwrap());
+        // let MinorVersion = WORD::from_le_bytes(buf[..mem::size_of::<WORD>()].try_into().unwrap());
         buf = &buf[mem::size_of::<WORD>()..];
 
         let FileReferenceNumber = FILE_ID_128 {
@@ -114,13 +136,13 @@ impl USN_RECORD_V3 {
         };
         buf = &buf[mem::size_of::<LARGE_INTEGER>()..];
 
-        let Reason = DWORD::from_le_bytes(buf[..mem::size_of::<DWORD>()].try_into().unwrap());
+        // let Reason = DWORD::from_le_bytes(buf[..mem::size_of::<DWORD>()].try_into().unwrap());
         buf = &buf[mem::size_of::<DWORD>()..];
 
-        let SourceInfo = DWORD::from_le_bytes(buf[..mem::size_of::<DWORD>()].try_into().unwrap());
+        // let SourceInfo = DWORD::from_le_bytes(buf[..mem::size_of::<DWORD>()].try_into().unwrap());
         buf = &buf[mem::size_of::<DWORD>()..];
 
-        let SecurityId = DWORD::from_le_bytes(buf[..mem::size_of::<DWORD>()].try_into().unwrap());
+        // let SecurityId = DWORD::from_le_bytes(buf[..mem::size_of::<DWORD>()].try_into().unwrap());
         buf = &buf[mem::size_of::<DWORD>()..];
 
         let FileAttributes =
@@ -133,56 +155,50 @@ impl USN_RECORD_V3 {
         let FileNameOffset = WORD::from_le_bytes(buf[..mem::size_of::<WORD>()].try_into().unwrap());
         //buf = &buf[mem::size_of::<WORD>()..];
 
-        USN_RECORD_V3 {
-            RecordLength,
-            MajorVersion,
-            MinorVersion,
-            FileReferenceNumber,
-            ParentFileReferenceNumber,
-            Usn,
-            TimeStamp,
-            Reason,
-            SourceInfo,
-            SecurityId,
-            FileAttributes,
-            FileNameLength,
-            FileNameOffset,
-            FileName: [0],
+        if MajorVersion != 3 {
+            return Err(Error::UnknownUsnRecordVersion);
         }
-    }
 
-    fn to_entry(&self, filename: OsString) -> Result<MftEntry, Error> {
-        Ok(MftEntry {
-            file_ref_number: u128::from_le_bytes(self.FileReferenceNumber.Identifier),
-            parent_file_ref_number: u128::from_le_bytes(self.ParentFileReferenceNumber.Identifier),
-            usn: self.Usn,
-            timestamp: parse_time(self.TimeStamp)?,
-            attributes: self.FileAttributes,
+        let filename_end: usize = (FileNameOffset + FileNameLength).into();
+        if filename_end > orig_buf.len() {
+            return Err(Error::UsnRecordBadFilenameLength);
+        }
+
+        let mut filename = &orig_buf[FileNameOffset.into()..filename_end];
+        let filename = {
+            let mut wchars = Vec::with_capacity(filename.len() / mem::size_of::<WCHAR>());
+            while filename.len() >= mem::size_of::<WCHAR>() {
+                let (wchar, rest) = filename.split_at(mem::size_of::<WCHAR>());
+                filename = rest;
+                wchars.push(u16::from_le_bytes(wchar.try_into().unwrap()));
+            }
+            wchars
+        };
+        let filename = OsString::from_wide(&filename[..]);
+
+        Ok(JournalEntry {
+            file_ref_number: u128::from_le_bytes(FileReferenceNumber.Identifier),
+            parent_file_ref_number: u128::from_le_bytes(ParentFileReferenceNumber.Identifier),
+            usn: Usn,
+            timestamp: parse_time(TimeStamp)?,
+            is_directory: is_flag_set(FileAttributes, FILE_ATTRIBUTE_DIRECTORY),
+            is_reparse_point: is_flag_set(FileAttributes, FILE_ATTRIBUTE_REPARSE_POINT),
+            is_temporary: is_flag_set(FileAttributes, FILE_ATTRIBUTE_TEMPORARY),
             filename,
         })
     }
 }
 
-#[derive(Debug)]
-pub struct MftEntry {
-    pub file_ref_number: u128,
-    pub parent_file_ref_number: u128,
-    pub usn: USN,
-    pub timestamp: DateTime<Utc>,
-    pub attributes: DWORD,
-    pub filename: OsString,
-}
-
-pub struct MftEntryIterator {
+pub struct JournalEntryIterator {
     handle: VolumeHandle,
     next_start_number: DWORDLONG,
-    parsed_entries: VecDeque<MftEntry>,
+    parsed_entries: VecDeque<JournalEntry>,
     buffer: Vec<u8>,
     has_errored: bool,
 }
-impl MftEntryIterator {
+impl JournalEntryIterator {
     pub fn new(handle: VolumeHandle) -> Self {
-        MftEntryIterator {
+        JournalEntryIterator {
             handle,
             next_start_number: 0,
             parsed_entries: VecDeque::with_capacity(1024),
@@ -191,8 +207,8 @@ impl MftEntryIterator {
         }
     }
 }
-impl Iterator for MftEntryIterator {
-    type Item = Result<MftEntry, Error>;
+impl Iterator for JournalEntryIterator {
+    type Item = Result<JournalEntry, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.has_errored {
@@ -277,31 +293,7 @@ impl Iterator for MftEntryIterator {
             let (usn_data, rest) = result_data.split_at(record_length);
             result_data = rest;
 
-            let usn_record = USN_RECORD_V3::from_bytes(usn_data);
-            if usn_record.MajorVersion != 3 {
-                self.has_errored = true;
-                return Some(Err(Error::UnknownUsnRecordVersion));
-            }
-
-            let filename_end: usize =
-                (usn_record.FileNameOffset + usn_record.FileNameLength).into();
-            if filename_end > usn_data.len() {
-                self.has_errored = true;
-                return Some(Err(Error::UsnRecordBadFilenameLength));
-            }
-
-            let mut filename = &usn_data[usn_record.FileNameOffset.into()..filename_end];
-            let filename = {
-                let mut wchars = Vec::with_capacity(filename.len() / mem::size_of::<WCHAR>());
-                while filename.len() >= mem::size_of::<WCHAR>() {
-                    let (wchar, rest) = filename.split_at(mem::size_of::<WCHAR>());
-                    filename = rest;
-                    wchars.push(u16::from_le_bytes(wchar.try_into().unwrap()));
-                }
-                wchars
-            };
-            let filename = OsString::from_wide(&filename[..]);
-            match usn_record.to_entry(filename) {
+            match JournalEntry::parse_usn_entry(usn_data) {
                 Ok(entry) => self.parsed_entries.push_back(entry),
                 Err(err) => {
                     self.has_errored = true;
