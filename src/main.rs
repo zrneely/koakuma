@@ -8,7 +8,7 @@ fn main() {
         Ok(true) => {}
         Ok(false) => {
             println!("Koumakan must be run elevated!");
-            println!("Continuing anyway, although things will probably fail.");
+            println!("Continuing anyway, although things will almost certainly fail.");
         }
         Err(err) => {
             println!("Failed to check privilege level: {:?}", err);
@@ -19,7 +19,7 @@ fn main() {
     for volume in volumes::VolumeIterator::new().unwrap() {
         let volume = volume.unwrap();
         if !volume.paths.is_empty() {
-            println!("Opening handle to {:?}", volume.paths[0]);
+            println!("Opening handle to {:?}...", volume.paths[0]);
 
             match volume.get_handle() {
                 Ok(handle) => {
@@ -28,13 +28,7 @@ fn main() {
 
                     let mut count = 0;
                     let time_taken = chrono::Duration::span(|| {
-                        count = mft_iter
-                            .inspect(|x| {
-                                if x.is_err() {
-                                    panic!("wow")
-                                }
-                            })
-                            .count();
+                        count = mft_iter.map(|x| x.unwrap()).count();
                     });
 
                     println!("{} total MFT entries read in {:?}", count, time_taken);
