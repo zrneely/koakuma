@@ -8,13 +8,20 @@ use winapi::{
     },
     um::{
         errhandlingapi as ehapi,
+        fileapi::FILE_STREAM_INFO,
+        handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
         ioapiset::DeviceIoControl,
-        minwinbase::SYSTEMTIME,
+        minwinbase::{FileStreamInfo, SYSTEMTIME},
         timezoneapi::FileTimeToSystemTime,
+        winbase::{
+            ExtendedFileIdType, GetFileInformationByHandleEx, OpenFileById,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_DESCRIPTOR,
+        },
         winioctl::FSCTL_ENUM_USN_DATA,
         winnt::{
             DWORDLONG, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-            FILE_ATTRIBUTE_TEMPORARY, FILE_ID_128, LARGE_INTEGER, LONGLONG, USN, WCHAR,
+            FILE_ATTRIBUTE_TEMPORARY, FILE_ID_128, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, LARGE_INTEGER, LONGLONG, USN, WCHAR,
         },
     },
 };
@@ -91,6 +98,114 @@ fn is_flag_set(data: DWORD, flag: DWORD) -> bool {
 }
 
 #[derive(Debug)]
+pub struct FileSizeInfo {
+    pub logical_size: u64,
+    pub physical_size: u64,
+    pub stream_count: u64,
+}
+
+// Result is (logical, physical)
+#[allow(non_snake_case)]
+fn get_size_info_for_file(
+    vol_handle: &VolumeHandle,
+    file_id: &FILE_ID_128,
+    buf: &mut [u8],
+) -> Result<FileSizeInfo, Error> {
+    // To get the file size, we need a handle. Since we have the ID, open with that.
+    let mut file_id_descriptor = FILE_ID_DESCRIPTOR {
+        dwSize: mem::size_of::<FILE_ID_DESCRIPTOR>().try_into().unwrap(),
+        Type: ExtendedFileIdType,
+        u: Default::default(),
+    };
+    *unsafe { file_id_descriptor.u.ExtendedFileId_mut() } = *file_id;
+
+    let handle = unsafe {
+        OpenFileById(
+            **vol_handle,
+            &mut file_id_descriptor,
+            0, // we need neither read nor write access
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null_mut(),
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        let err = unsafe { ehapi::GetLastError() };
+        return Err(Error::OpenHandleForSizeFailed(err));
+    }
+
+    let success = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileStreamInfo,
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len().try_into().unwrap(),
+        )
+    };
+
+    unsafe { CloseHandle(handle) };
+
+    if success == 0 {
+        let err = unsafe { ehapi::GetLastError() };
+        return Err(Error::GetFileInformationFailed(err));
+    }
+
+    let mut stream_count = 0;
+    let mut logical_size = 0u64;
+    let mut physical_size = 0u64;
+
+    let mut remaining_entry_data: &[u8] = buf;
+    loop {
+        stream_count += 1;
+
+        let mut current_entry = &remaining_entry_data[..mem::size_of::<FILE_STREAM_INFO>()];
+        // Read a FILE_STREAM_INFO from the beginning of the result_data.
+        let NextEntryOffset = DWORD::from_le_bytes(
+            current_entry[0..mem::size_of::<DWORD>()]
+                .try_into()
+                .unwrap(),
+        );
+        current_entry = &current_entry[mem::size_of::<DWORD>()..];
+
+        // Skip StreamNameLength
+        current_entry = &current_entry[mem::size_of::<DWORD>()..];
+
+        let StreamSize = LONGLONG::from_le_bytes(
+            current_entry[..mem::size_of::<LONGLONG>()]
+                .try_into()
+                .unwrap(),
+        );
+        current_entry = &current_entry[mem::size_of::<LARGE_INTEGER>()..];
+
+        let StreamAllocationSize = LONGLONG::from_le_bytes(
+            current_entry[..mem::size_of::<LONGLONG>()]
+                .try_into()
+                .unwrap(),
+        );
+        // current_entry = &current_entry[mem::size_of::<LARGE_INTEGER>()..];
+
+        let next_entry_offset = NextEntryOffset.try_into().unwrap();
+        logical_size = logical_size.saturating_add(StreamSize.try_into().unwrap());
+        physical_size = physical_size.saturating_add(StreamAllocationSize.try_into().unwrap());
+
+        // Skip stream name, etc.
+        if next_entry_offset == 0 {
+            break;
+        } else if next_entry_offset > remaining_entry_data.len() {
+            return Err(Error::FileStreamInfoBadNextEntry);
+        } else {
+            remaining_entry_data = &remaining_entry_data[..next_entry_offset];
+        }
+    }
+
+    Ok(FileSizeInfo {
+        logical_size,
+        physical_size,
+        stream_count,
+    })
+}
+
+#[derive(Debug)]
 pub struct JournalEntry {
     pub file_ref_number: u128,
     pub parent_file_ref_number: u128,
@@ -99,11 +214,16 @@ pub struct JournalEntry {
     pub is_directory: bool,
     pub is_reparse_point: bool,
     pub is_temporary: bool,
-    pub filename: OsString,
+    pub filename: String,
+    pub file_size_info: FileSizeInfo,
 }
 impl JournalEntry {
     #[allow(non_snake_case)] // to match what the Windows API provides
-    fn parse_usn_entry(mut buf: &[u8]) -> Result<Self, Error> {
+    fn parse_usn_entry(
+        vol_handle: &VolumeHandle,
+        mut buf: &[u8],
+        stream_info_buffer: &mut [u8],
+    ) -> Result<Self, Error> {
         let orig_buf = buf;
 
         //let RecordLength = DWORD::from_le_bytes(buf[..mem::size_of::<DWORD>()].try_into().unwrap());
@@ -174,17 +294,32 @@ impl JournalEntry {
             }
             wchars
         };
-        let filename = OsString::from_wide(&filename[..]);
+        let filename = OsString::from_wide(&filename[..])
+            .as_os_str()
+            .to_string_lossy()
+            .into();
+
+        let is_directory = is_flag_set(FileAttributes, FILE_ATTRIBUTE_DIRECTORY);
+        let file_size_info = if !is_directory {
+            get_size_info_for_file(vol_handle, &FileReferenceNumber, stream_info_buffer)?
+        } else {
+            FileSizeInfo {
+                logical_size: 0,
+                physical_size: 0,
+                stream_count: 0,
+            }
+        };
 
         Ok(JournalEntry {
             file_ref_number: u128::from_le_bytes(FileReferenceNumber.Identifier),
             parent_file_ref_number: u128::from_le_bytes(ParentFileReferenceNumber.Identifier),
             usn: Usn,
             timestamp: parse_time(TimeStamp)?,
-            is_directory: is_flag_set(FileAttributes, FILE_ATTRIBUTE_DIRECTORY),
+            is_directory,
             is_reparse_point: is_flag_set(FileAttributes, FILE_ATTRIBUTE_REPARSE_POINT),
             is_temporary: is_flag_set(FileAttributes, FILE_ATTRIBUTE_TEMPORARY),
             filename,
+            file_size_info,
         })
     }
 }
@@ -194,6 +329,7 @@ pub struct JournalEntryIterator {
     next_start_number: DWORDLONG,
     parsed_entries: VecDeque<JournalEntry>,
     buffer: Vec<u8>,
+    stream_info_buffer: Vec<u8>,
     has_errored: bool,
 }
 impl JournalEntryIterator {
@@ -202,7 +338,8 @@ impl JournalEntryIterator {
             handle,
             next_start_number: 0,
             parsed_entries: VecDeque::with_capacity(1024),
-            buffer: vec![0; 4 * 1024 * 1024],
+            buffer: vec![0; 4 * 1024 * 1024],       // 4 MiB
+            stream_info_buffer: vec![0; 64 * 1024], // 64 KiB
             has_errored: false,
         }
     }
@@ -293,7 +430,11 @@ impl Iterator for JournalEntryIterator {
             let (usn_data, rest) = result_data.split_at(record_length);
             result_data = rest;
 
-            match JournalEntry::parse_usn_entry(usn_data) {
+            match JournalEntry::parse_usn_entry(
+                &self.handle,
+                usn_data,
+                &mut self.stream_info_buffer[..],
+            ) {
                 Ok(entry) => self.parsed_entries.push_back(entry),
                 Err(err) => {
                     self.has_errored = true;

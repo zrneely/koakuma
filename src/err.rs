@@ -39,17 +39,32 @@ pub enum Error {
     GetVolumePathNamesFailed(DWORD),
     OpenVolumeHandleFailed(DWORD),
     MissingNullTerminator,
-    FsctlEnumUsnDataResultTooSmall,
-    TimeConversionFailure(DWORD),
-    InvalidTimeRepr,
-    UnknownUsnRecordVersion,
-    FsctlEnumUsnDataFailed(DWORD),
-    UsnRecordBadLength,
-    UsnRecordBadFilenameLength,
+    // FsctlEnumUsnDataResultTooSmall,
+    // TimeConversionFailure(DWORD),
+    // InvalidTimeRepr,
+    // UnknownUsnRecordVersion,
+    // FsctlEnumUsnDataFailed(DWORD),
+    // UsnRecordBadLength,
+    // UsnRecordBadFilenameLength,
+    // OpenHandleForSizeFailed(DWORD),
+    // GetFileInformationFailed(DWORD),
+    // FileStreamInfoBadNextEntry,
+    GetNtfsVolumeDataFailed(DWORD),
+    UnknownNtfsVersion,
+    GetNtfsVolumeDataBadSize,
+    OpenMftFailed(DWORD),
+    GetRetrievalPointersFailed(DWORD),
+    ReadVolumeFailed(DWORD),
 }
 impl From<NulError> for Error {
     fn from(err: NulError) -> Self {
         Error::CStringNulError(err)
+    }
+}
+impl std::error::Error for Error {}
+impl std::fmt::Display for Error {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        <Error as std::fmt::Debug>::fmt(self, fmt)
     }
 }
 impl std::fmt::Debug for Error {
@@ -88,25 +103,48 @@ impl std::fmt::Debug for Error {
                 (msg_from_error(*code), Some(*code), "OpenVolumeHandleFailed")
             }
             MissingNullTerminator => (None, None, "MissingNullTerminator"),
-            FsctlEnumUsnDataResultTooSmall => (None, None, "FsctlEnumUsnDataResultTooSmall"),
-            TimeConversionFailure(code) => {
-                (msg_from_error(*code), Some(*code), "TimeConversionFailure")
-            }
-            InvalidTimeRepr => (None, None, "InvalidTimeRepr"),
-            UnknownUsnRecordVersion => (None, None, "UnknownUsnRecordVersion"),
-            FsctlEnumUsnDataFailed(code) => {
-                (msg_from_error(*code), Some(*code), "FsctlEnumUsnDataFailed")
-            }
-            UsnRecordBadLength => (None, None, "UsnRecordBadLength"),
-            UsnRecordBadFilenameLength => (None, None, "UsnRecordBadFilenameLength"),
+            // FsctlEnumUsnDataResultTooSmall => (None, None, "FsctlEnumUsnDataResultTooSmall"),
+            // TimeConversionFailure(code) => {
+            //     (msg_from_error(*code), Some(*code), "TimeConversionFailure")
+            // }
+            // InvalidTimeRepr => (None, None, "InvalidTimeRepr"),
+            // UnknownUsnRecordVersion => (None, None, "UnknownUsnRecordVersion"),
+            // FsctlEnumUsnDataFailed(code) => {
+            //     (msg_from_error(*code), Some(*code), "FsctlEnumUsnDataFailed")
+            // }
+            // UsnRecordBadLength => (None, None, "UsnRecordBadLength"),
+            // UsnRecordBadFilenameLength => (None, None, "UsnRecordBadFilenameLength"),
+            // OpenHandleForSizeFailed(code) => (
+            //     msg_from_error(*code),
+            //     Some(*code),
+            //     "OpenHandleForSizeFailed",
+            // ),
+            // GetFileInformationFailed(code) => (
+            //     msg_from_error(*code),
+            //     Some(*code),
+            //     "GetFileInformationFailed",
+            // ),
+            // FileStreamInfoBadNextEntry => (None, None, "FileStreamInfoBadNextEntry"),
+            GetNtfsVolumeDataFailed(code) => (
+                msg_from_error(*code),
+                Some(*code),
+                "GetNtfsVolumeDataFailed",
+            ),
+            UnknownNtfsVersion => (None, None, "UnknownNtfsVersion"),
+            GetNtfsVolumeDataBadSize => (None, None, "GetNtfsVolumeDataBadSize"),
+            OpenMftFailed(code) => (msg_from_error(*code), Some(*code), "OpenMftFailed"),
+            GetRetrievalPointersFailed(code) => (
+                msg_from_error(*code),
+                Some(*code),
+                "GetRetrievalPointersFailed",
+            ),
+            ReadVolumeFailed(code) => (msg_from_error(*code), Some(*code), "ReadVolumeFailed"),
         };
 
-        if let Some(text) = text {
-            fmt.debug_tuple(name).field(&text).finish()
-        } else if let Some(code) = code {
-            fmt.debug_tuple(name).field(&code).finish()
-        } else {
-            fmt.write_str(name)
+        match (text, code) {
+            (Some(text), Some(code)) => fmt.debug_tuple(name).field(&text).field(&code).finish(),
+            (None, Some(code)) => fmt.debug_tuple(name).field(&code).finish(),
+            (_, _) => fmt.debug_tuple(name).finish(),
         }
     }
 }

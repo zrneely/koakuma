@@ -1,4 +1,4 @@
-use crate::err::Error;
+use crate::{err::Error, SafeHandle};
 
 use winapi::{
     shared::winerror,
@@ -8,7 +8,7 @@ use winapi::{
             CreateFile2, FindFirstVolumeW, FindNextVolumeW, FindVolumeClose,
             GetVolumePathNamesForVolumeNameW, OPEN_EXISTING,
         },
-        handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
+        handleapi::INVALID_HANDLE_VALUE,
         winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, HANDLE},
     },
 };
@@ -16,27 +16,9 @@ use winapi::{
 use std::{
     convert::TryInto as _,
     ffi::OsString,
-    ops::Deref,
     os::windows::ffi::{OsStrExt as _, OsStringExt as _},
     ptr,
 };
-
-#[derive(Debug)]
-pub struct VolumeHandle {
-    handle: HANDLE,
-}
-impl Deref for VolumeHandle {
-    type Target = HANDLE;
-
-    fn deref(&self) -> &Self::Target {
-        &self.handle
-    }
-}
-impl Drop for VolumeHandle {
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.handle) };
-    }
-}
 
 #[derive(Debug)]
 pub struct VolumeInfo {
@@ -44,7 +26,7 @@ pub struct VolumeInfo {
     pub paths: Vec<OsString>,
 }
 impl VolumeInfo {
-    pub fn get_handle(&self) -> Result<VolumeHandle, Error> {
+    pub fn get_handle(&self) -> Result<SafeHandle, Error> {
         let filename = {
             let mut filename = self.name.as_os_str().encode_wide().collect::<Vec<_>>();
             // Replace the trailing backslash with a null terminator. We need the null
@@ -64,7 +46,7 @@ impl VolumeInfo {
         };
 
         if handle != INVALID_HANDLE_VALUE {
-            Ok(VolumeHandle { handle })
+            Ok(SafeHandle { handle })
         } else {
             let err = unsafe { ehapi::GetLastError() };
             Err(Error::OpenVolumeHandleFailed(err))
