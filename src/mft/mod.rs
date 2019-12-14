@@ -89,8 +89,8 @@ impl CheatingFileStream {
     fn populate_buffers(&mut self) -> Result<(), Error> {
         let extent_to_read = self.extents[self.current_extent];
         println!(
-            "populate_buffers: {:?} {:?}",
-            extent_to_read, self.current_extent
+            "populate_buffers: {:?} {:?} {:?}",
+            extent_to_read, self.current_extent, self.current_extent_offset
         );
 
         let starting_offset =
@@ -182,6 +182,7 @@ impl io::Read for CheatingFileStream {
             }
         }
 
+        println!("done with CFS::read: {}", bytes_written);
         Ok(bytes_written)
     }
 }
@@ -215,7 +216,7 @@ impl MasterFileTable {
     }
 
     pub fn read_1k(&mut self) {
-        let mut buf = vec![0; 1024];
+        let mut buf = vec![0; 5 * 1024];
         self.mft_stream.read_exact(&mut buf[..]).unwrap();
 
         println!("Read 1k of MFT: {:x?}", buf);
