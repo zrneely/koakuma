@@ -40,8 +40,8 @@ pub enum Error {
     OpenVolumeHandleFailed(DWORD),
     MissingNullTerminator,
     // FsctlEnumUsnDataResultTooSmall,
-    // TimeConversionFailure(DWORD),
-    // InvalidTimeRepr,
+    TimeConversionFailure(DWORD),
+    InvalidTimeRepr,
     // UnknownUsnRecordVersion,
     // FsctlEnumUsnDataFailed(DWORD),
     // UsnRecordBadLength,
@@ -55,6 +55,13 @@ pub enum Error {
     OpenMftFailed(DWORD),
     GetRetrievalPointersFailed(DWORD),
     ReadVolumeFailed(DWORD),
+    MftHasNoExtents,
+    MftStartLcnNotFirstExtent,
+    ReadMftFailed(std::io::Error),
+    UnknownFormCode(u8),
+    UnknownAttributeTypeCode(u32),
+    UnknownFilenameType(u8),
+    UnsupportedNonResident(u32),
 }
 impl From<NulError> for Error {
     fn from(err: NulError) -> Self {
@@ -104,10 +111,10 @@ impl std::fmt::Debug for Error {
             }
             MissingNullTerminator => (None, None, "MissingNullTerminator"),
             // FsctlEnumUsnDataResultTooSmall => (None, None, "FsctlEnumUsnDataResultTooSmall"),
-            // TimeConversionFailure(code) => {
-            //     (msg_from_error(*code), Some(*code), "TimeConversionFailure")
-            // }
-            // InvalidTimeRepr => (None, None, "InvalidTimeRepr"),
+            TimeConversionFailure(code) => {
+                (msg_from_error(*code), Some(*code), "TimeConversionFailure")
+            }
+            InvalidTimeRepr => (None, None, "InvalidTimeRepr"),
             // UnknownUsnRecordVersion => (None, None, "UnknownUsnRecordVersion"),
             // FsctlEnumUsnDataFailed(code) => {
             //     (msg_from_error(*code), Some(*code), "FsctlEnumUsnDataFailed")
@@ -139,6 +146,27 @@ impl std::fmt::Debug for Error {
                 "GetRetrievalPointersFailed",
             ),
             ReadVolumeFailed(code) => (msg_from_error(*code), Some(*code), "ReadVolumeFailed"),
+            MftHasNoExtents => (None, None, "MftHasNoExtents"),
+            MftStartLcnNotFirstExtent => (None, None, "MftStartLcnNotFirstExtent"),
+            ReadMftFailed(err) => return fmt.debug_tuple("ReadMftFailed").field(err).finish(),
+            UnknownFormCode(code) => {
+                return fmt.debug_tuple("UnknownFormCode").field(code).finish();
+            }
+            UnknownAttributeTypeCode(code) => {
+                return fmt
+                    .debug_tuple("UnknownAttributeTypeCode")
+                    .field(code)
+                    .finish();
+            }
+            UnknownFilenameType(code) => {
+                return fmt.debug_tuple("UnknownFilenameType").field(code).finish();
+            }
+            UnsupportedNonResident(code) => {
+                return fmt
+                    .debug_tuple("UnsupportedNonResident")
+                    .field(code)
+                    .finish();
+            }
         };
 
         match (text, code) {

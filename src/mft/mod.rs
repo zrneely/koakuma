@@ -1,197 +1,172 @@
 use crate::{err::Error, SafeHandle};
 
+use chrono::{DateTime, TimeZone as _, Utc};
 use winapi::{
-    shared::{minwindef::DWORD, winerror},
+    shared::minwindef::FILETIME,
     um::{
         errhandlingapi as ehapi,
-        fileapi::{CreateFileW, ReadFile, OPEN_EXISTING},
+        fileapi::{CreateFileW, OPEN_EXISTING},
         handleapi::INVALID_HANDLE_VALUE,
         ioapiset::DeviceIoControl,
-        minwinbase::OVERLAPPED,
+        minwinbase::SYSTEMTIME,
+        timezoneapi::FileTimeToSystemTime,
         winbase::FILE_FLAG_BACKUP_SEMANTICS,
         winioctl::{
-            FSCTL_GET_NTFS_VOLUME_DATA, FSCTL_GET_RETRIEVAL_POINTERS, NTFS_EXTENDED_VOLUME_DATA,
-            NTFS_VOLUME_DATA_BUFFER,
+            FSCTL_GET_NTFS_VOLUME_DATA, NTFS_EXTENDED_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER,
         },
-        winnt::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, LARGE_INTEGER, LONGLONG},
+        winnt::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE},
     },
 };
 
 use std::{
     convert::TryInto as _,
-    ffi::{c_void, OsStr},
-    io::{self, prelude::*},
+    ffi::{c_void, OsStr, OsString},
+    io::prelude::*,
     mem,
-    os::windows::ffi::OsStrExt as _,
+    os::windows::ffi::{OsStrExt as _, OsStringExt as _},
     path::Path,
     ptr,
 };
 
+mod read_volume;
 mod sys;
 
 const NTFS_VOLUME_DATA_BUFFER_SIZE: usize =
     (mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() + mem::size_of::<NTFS_EXTENDED_VOLUME_DATA>());
 
-// Represents a continuous list of logical clusters in one file.
-#[derive(Debug, Clone, Copy)]
-struct Extent {
-    min_vcn: LONGLONG,
-    min_lcn: LONGLONG,
-    cluster_count: LONGLONG,
+#[derive(Debug)]
+pub struct StandardFlags {
+    pub is_read_only: bool,
+    pub is_hidden: bool,
+    pub is_system: bool,
+    pub is_archive: bool,
+    pub is_device: bool,
+    pub is_normal: bool,
+    pub is_temporary: bool,
+    pub is_sparse: bool,
+    pub is_reparse_point: bool,
+    pub is_compressed: bool,
+    pub is_offline: bool,
+    pub is_not_indexed: bool,
+    pub is_encrypted: bool,
+    pub is_directory: bool,
+    pub is_index_view: bool,
+}
+impl From<u32> for StandardFlags {
+    fn from(flags: u32) -> Self {
+        StandardFlags {
+            is_read_only: is_flag_set(flags, sys::standard_info_flags::READ_ONLY),
+            is_hidden: is_flag_set(flags, sys::standard_info_flags::HIDDEN),
+            is_system: is_flag_set(flags, sys::standard_info_flags::SYSTEM),
+            is_archive: is_flag_set(flags, sys::standard_info_flags::ARCHIVE),
+            is_device: is_flag_set(flags, sys::standard_info_flags::DEVICE),
+            is_normal: is_flag_set(flags, sys::standard_info_flags::NORMAL),
+            is_temporary: is_flag_set(flags, sys::standard_info_flags::TEMPORARY),
+            is_sparse: is_flag_set(flags, sys::standard_info_flags::SPARSE),
+            is_reparse_point: is_flag_set(flags, sys::standard_info_flags::REPARSE_POINT),
+            is_compressed: is_flag_set(flags, sys::standard_info_flags::COMPRESSED),
+            is_offline: is_flag_set(flags, sys::standard_info_flags::OFFLINE),
+            is_not_indexed: is_flag_set(flags, sys::standard_info_flags::NOT_INDEXED),
+            is_encrypted: is_flag_set(flags, sys::standard_info_flags::ENCRYPTED),
+            is_directory: is_flag_set(flags, sys::standard_info_flags::DIRECTORY),
+            is_index_view: is_flag_set(flags, sys::standard_info_flags::INDEX_VIEW),
+        }
+    }
 }
 
-// Reads from a file using a file handle without read access, using a volume handle.
-struct CheatingFileStream {
-    volume_handle: SafeHandle,
-
-    bytes_per_cluster: i64,
-    extents: Vec<Extent>,
-    current_extent: usize,
-    current_extent_offset: i64,
-
-    buffer: Vec<u8>,
-    buffer_valid_from: usize,
-    buffer_valid_to: usize,
+#[derive(Debug)]
+pub enum FileNameType {
+    Posix,
+    Win32,
+    Dos,
+    Win32AndDos,
 }
-impl CheatingFileStream {
-    fn new(
-        volume_handle: SafeHandle,
-        volume_info: NTFS_VOLUME_DATA_BUFFER,
-        file_handle: &SafeHandle,
-    ) -> Result<Self, Error> {
-        let extents = load_file_extents(&file_handle)?;
-        println!("extents: {:#?}", extents);
 
-        Ok(CheatingFileStream {
-            volume_handle,
-            bytes_per_cluster: volume_info.BytesPerCluster.into(),
-            extents,
-            current_extent: 0,
-            current_extent_offset: 0,
-            buffer: vec![0; 4 * 1024],
-            buffer_valid_from: 4 * 1024, // not valid at all
-            buffer_valid_to: 4 * 1024,
-        })
-    }
+#[derive(Debug)]
+pub enum Attribute {
+    // read-only, timestamps, hard link count, etc
+    StandardInformation {
+        name: Option<String>,
+        created: DateTime<Utc>,
+        modified: DateTime<Utc>,
+        mft_record_modified: DateTime<Utc>,
+        accessed: DateTime<Utc>,
+        flags: StandardFlags,
+        max_versions: u32,
+        version_number: u32,
+        class_id: u32,
+        owner_id: u32,
+        security_id: u32,
+        quota_charged: u64,
+        update_sequence_number: u64,
+    },
 
-    fn consume_buffer(&mut self, consumed: usize) {
-        self.buffer_valid_from = self.buffer_valid_from.saturating_add(consumed);
-    }
-
-    fn get_valid_buffer(&self) -> &[u8] {
-        &self.buffer[self.buffer_valid_from..self.buffer_valid_to]
-    }
-
-    fn has_more_extents(&self) -> bool {
-        self.current_extent < self.extents.len()
-    }
-
-    fn populate_buffers(&mut self) -> Result<(), Error> {
-        let extent_to_read = self.extents[self.current_extent];
-        println!(
-            "populate_buffers: {:?} {:?} {:?}",
-            extent_to_read, self.current_extent, self.current_extent_offset
-        );
-
-        let starting_offset =
-            (extent_to_read.min_lcn * self.bytes_per_cluster) + self.current_extent_offset;
-        let ending_offset =
-            (extent_to_read.min_lcn + extent_to_read.cluster_count) * self.bytes_per_cluster;
-        let len_to_read = self.buffer.len().min(
-            ending_offset
-                .saturating_sub(starting_offset)
-                .try_into()
-                .unwrap(),
-        );
-
-        let mut ov = OVERLAPPED::default();
-        unsafe { ov.u.s_mut() }.Offset = ((starting_offset as u64) & 0x0000_0000_FFFF_FFFFu64)
-            .try_into()
-            .unwrap();
-        unsafe { ov.u.s_mut() }.OffsetHigh =
-            (((starting_offset as u64) & 0xFFFF_FFFF_0000_0000u64) >> 32)
-                .try_into()
-                .unwrap();
-
-        println!("calling ReadFile");
-        let mut num_bytes_read = 0;
-        let success = unsafe {
-            ReadFile(
-                *self.volume_handle,
-                self.buffer.as_mut_ptr() as *mut c_void,
-                len_to_read.try_into().unwrap(),
-                &mut num_bytes_read,
-                &mut ov,
-            )
-        };
-        if success == 0 {
-            let err = unsafe { ehapi::GetLastError() };
-            return Err(Error::ReadVolumeFailed(err));
-        }
-
-        println!("read done successfully: {:?}", num_bytes_read);
-
-        self.buffer_valid_from = 0;
-        self.buffer_valid_to = num_bytes_read.try_into().unwrap();
-        self.current_extent_offset += num_bytes_read as i64;
-
-        if self.current_extent_offset > extent_to_read.cluster_count * self.bytes_per_cluster {
-            self.current_extent += 1;
-            self.current_extent_offset = 0;
-        }
-
-        Ok(())
-    }
+    // list of attributes that make up the file
+    AttributeList {
+        name: Option<String>,
+    },
+    // one of the names of the file
+    FileName {
+        // name OF THE ATTRIBUTE, not the file name
+        name: Option<String>,
+        filename: OsString,
+        filename_type: FileNameType,
+        created: DateTime<Utc>,
+        modified: DateTime<Utc>,
+        mft_record_modified: DateTime<Utc>,
+        accessed: DateTime<Utc>,
+        flags: StandardFlags,
+        logical_size: u64,
+        physical_size: u64,
+        reparse_tag: u32,
+    },
+    // if present, a 64-bit identifier assigned by a link-tracking service
+    ObjectId {
+        name: Option<String>,
+    },
+    // volume label; only present on volume files
+    VolumeName {
+        name: Option<String>,
+    },
+    // only present on volume files
+    VolumeInformation {
+        name: Option<String>,
+    },
+    // actual file content
+    Data {
+        name: Option<String>,
+        logical_size: u64,
+        physical_size: u64,
+    },
+    // used for filename allocation for large directories
+    IndexRoot {
+        name: Option<String>,
+    },
+    // used for filename allocation for large directories
+    IndexAllocation {
+        name: Option<String>,
+    },
+    // bitmap index for a large directory
+    Bitmap {
+        name: Option<String>,
+        logical_size: u64,
+        physical_size: u64,
+    },
+    // reparse data
+    ReparsePoint {
+        name: Option<String>,
+    },
 }
-impl io::Read for CheatingFileStream {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
-        println!("CFS::read, buf len: {}", buf.len());
 
-        if self.get_valid_buffer().len() >= buf.len() {
-            println!("in easy CFS::read case");
-            buf.copy_from_slice(&self.get_valid_buffer()[..buf.len()]);
-            self.consume_buffer(buf.len());
-            return Ok(buf.len());
-        }
-
-        println!(
-            "extents: {}, next_extent: {}",
-            self.extents.len(),
-            self.current_extent
-        );
-
-        let mut bytes_written = 0;
-        while bytes_written < buf.len() && self.has_more_extents() {
-            let valid_buffer = self.get_valid_buffer();
-            println!(
-                "CFS::read: buf len: {}, bytes written: {}, valid_buf len: {}",
-                buf.len(),
-                bytes_written,
-                valid_buffer.len()
-            );
-            if !valid_buffer.is_empty() {
-                let len_to_copy = valid_buffer.len().min(buf.len() - bytes_written);
-                let source = &valid_buffer[..len_to_copy];
-                let dest = &mut buf[bytes_written..bytes_written + len_to_copy];
-                dest.copy_from_slice(source);
-                self.consume_buffer(len_to_copy);
-                bytes_written += len_to_copy;
-            } else {
-                self.populate_buffers()
-                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-            }
-        }
-
-        println!("done with CFS::read: {}", bytes_written);
-        Ok(bytes_written)
-    }
+#[derive(Debug)]
+pub struct MftEntry {
+    pub attributes: Vec<Attribute>,
+    pub is_file_name_index_present: bool,
 }
 
 pub struct MasterFileTable {
-    mft_stream: CheatingFileStream,
-
-    starting_lcn: LARGE_INTEGER, // the logical cluster number that the MFT begins at
-    bytes_per_file_record_segment: DWORD, // the number of bytes in each segment of a file record
+    mft_stream: read_volume::CheatingFileStream,
+    segment_buffer: Vec<u8>,
 }
 impl MasterFileTable {
     pub fn load(volume_handle: SafeHandle, volume_path: &OsStr) -> Result<Self, Error> {
@@ -208,18 +183,131 @@ impl MasterFileTable {
         let mft_handle = get_mft_handle(volume_path)?;
 
         Ok(MasterFileTable {
-            mft_stream: CheatingFileStream::new(volume_handle, volume_data, &mft_handle)?,
-
-            starting_lcn: volume_data.MftStartLcn,
-            bytes_per_file_record_segment: volume_data.BytesPerFileRecordSegment,
+            mft_stream: read_volume::CheatingFileStream::new(
+                volume_handle,
+                volume_data,
+                &mft_handle,
+            )?,
+            segment_buffer: vec![0; volume_data.BytesPerFileRecordSegment.try_into().unwrap()],
         })
     }
 
-    pub fn read_1k(&mut self) {
-        let mut buf = vec![0; 5 * 1024];
-        self.mft_stream.read_exact(&mut buf[..]).unwrap();
+    pub fn len(&self) -> usize {
+        self.mft_stream.len()
+    }
+}
+impl Iterator for MasterFileTable {
+    type Item = Result<MftEntry, Error>;
 
-        println!("Read 1k of MFT: {:x?}", buf);
+    fn next(&mut self) -> Option<Self::Item> {
+        // We loop until we read a record that's in use and is not an extension of a previous one.
+        loop {
+            match self.mft_stream.read_exact(&mut self.segment_buffer[..]) {
+                Ok(_) => {}
+                Err(err) => return Some(Err(Error::ReadMftFailed(err))),
+            }
+
+            let (segment_header, _) = sys::FileRecordSegmentHeader::load(&self.segment_buffer[..]);
+
+            if (segment_header.flags & sys::segment_header_flags::FILE_RECORD_SEGMENT_IN_USE) == 0 {
+                println!("Skipping non-used record segment");
+                continue;
+            }
+
+            if segment_header.base_file_record_segment.segment_number_low != 0
+                || segment_header.base_file_record_segment.segment_number_high != 0
+            {
+                // This is an extension of a previous record; skip it.
+                continue;
+            }
+
+            let mut attribute_buffer =
+                &self.segment_buffer[segment_header.first_attribute_offset as usize..];
+
+            let mut attribs = Vec::new();
+
+            loop {
+                let (attrib_header, consumed) = sys::AttributeRecordHeader::load(attribute_buffer);
+                // TODO: use AttributeList-type attributes to read extension FILE records.
+
+                // It looks like attribute names are some sort of ASCII, with one byte-per-character.
+                // The length is explicitly one byte and the maximum characters are 255, according to the docs.
+                // This means it's *probably* valid UTF-8.
+                let attribute_name = match attrib_header.name_length {
+                    0 => None,
+                    length => {
+                        println!("Reading attribute name!");
+                        let name_start: usize = attrib_header.name_offset.try_into().unwrap();
+                        let name_end: usize = name_start + length as usize;
+                        let name_buffer = &attribute_buffer[name_start..name_end];
+                        println!("name buffer: {:?}", String::from_utf8_lossy(name_buffer));
+                        Some(String::from_utf8_lossy(name_buffer).into_owned())
+                    }
+                };
+
+                match attrib_header.form_code {
+                    sys::form_codes::RESIDENT => {
+                        let (resident_header, _) =
+                            sys::AttributeRecordHeaderResident::load(&attribute_buffer[consumed..]);
+
+                        // The data is resident, so we don't need additional reads to get it.
+                        // value_offset measures from the beginning of the attribute record.
+                        let start_offset = resident_header.value_offset as usize;
+                        let end_offset = start_offset + resident_header.value_length as usize;
+                        let attribute_data = &attribute_buffer[start_offset..end_offset];
+
+                        match parse_resident_attribute(
+                            &attrib_header,
+                            attribute_name,
+                            attribute_data,
+                        ) {
+                            Ok(attrib) => {
+                                println!("got attrib: {:#?}", attrib);
+                                attribs.push(attrib);
+                            }
+                            Err(err) => return Some(Err(err)),
+                        }
+                    }
+                    sys::form_codes::NON_RESIDENT => {
+                        let (nonresident_header, _) = sys::AttributeRecordHeaderNonResident::load(
+                            &attribute_buffer[consumed..],
+                        );
+
+                        // We should never need to read non-resident data
+                        match parse_non_resident_attribute(
+                            &attrib_header,
+                            &nonresident_header,
+                            attribute_name,
+                        ) {
+                            Ok(attrib) => {
+                                println!("got attrib: {:#?}", attrib);
+                                attribs.push(attrib);
+                            }
+                            Err(err) => return Some(Err(err)),
+                        }
+                    }
+
+                    unknown => {
+                        return Some(Err(Error::UnknownFormCode(unknown)));
+                    }
+                };
+
+                attribute_buffer =
+                    &attribute_buffer[attrib_header.record_length.try_into().unwrap()..];
+                if attribute_buffer.len() <= 4 || attribute_buffer[0..4] == [0xFF, 0xFF, 0xFF, 0xFF]
+                {
+                    println!("Found end thing");
+                    break;
+                }
+            }
+
+            return Some(Ok(MftEntry {
+                attributes: attribs,
+                is_file_name_index_present: (segment_header.flags
+                    & sys::segment_header_flags::FILE_NAME_INDEX_PRESENT)
+                    != 0,
+            }));
+        }
     }
 }
 
@@ -300,84 +388,140 @@ fn get_mft_handle(volume_path: &OsStr) -> Result<SafeHandle, Error> {
     }
 }
 
-fn load_file_extents(handle: &SafeHandle) -> Result<Vec<Extent>, Error> {
-    let mut result = Vec::new();
-    let mut current_starting_vcn = 0;
+fn parse_non_resident_attribute(
+    attrib_header: &sys::AttributeRecordHeader,
+    non_resident_header: &sys::AttributeRecordHeaderNonResident,
+    attribute_name: Option<String>,
+) -> Result<Attribute, Error> {
+    println!(
+        "non-resident: {:#?} {:#?} {:?}",
+        attrib_header, non_resident_header, attribute_name
+    );
 
-    // This should be big enough for all but the most fragmented files.
-    let mut retrieval_buffer = vec![0u8; 64 * 1024];
-
-    loop {
-        let mut result_size = 0;
-
-        let success = unsafe {
-            DeviceIoControl(
-                **handle,
-                FSCTL_GET_RETRIEVAL_POINTERS,
-                &mut current_starting_vcn as *mut LONGLONG as *mut c_void,
-                mem::size_of::<LONGLONG>().try_into().unwrap(),
-                retrieval_buffer.as_mut_ptr() as *mut c_void,
-                retrieval_buffer.len().try_into().unwrap(),
-                &mut result_size,
-                ptr::null_mut(),
-            )
-        };
-        let err = unsafe { ehapi::GetLastError() };
-        if success == 0 {
-            return Err(Error::GetRetrievalPointersFailed(err));
+    let attribute = match attrib_header.type_code {
+        type_code @ sys::attribute_types::STANDARD_INFORMATION => {
+            return Err(Error::UnsupportedNonResident(type_code))
         }
 
-        let mut returned_buffer = &retrieval_buffer[..result_size as usize];
+        sys::attribute_types::DATA => Attribute::Data {
+            name: attribute_name,
+            logical_size: non_resident_header.file_size,
+            physical_size: non_resident_header.allocated_length,
+        },
 
-        // The first DWORD in the buffer is the number of Extents returned.
-        let extent_count = DWORD::from_le_bytes(
-            returned_buffer[0..mem::size_of::<DWORD>()]
-                .try_into()
-                .unwrap(),
-        );
-        // Note that we have now consumed sizeof(LONGLONG) bytes due to struct padding.
-        returned_buffer = &returned_buffer[mem::size_of::<LONGLONG>()..];
+        sys::attribute_types::BITMAP => Attribute::Bitmap {
+            name: attribute_name,
+            logical_size: non_resident_header.file_size,
+            physical_size: non_resident_header.allocated_length,
+        },
 
-        // That's followed by a LARGE_INTEGER representing the first VCN mapping returned.
-        let mut min_vcn = LONGLONG::from_le_bytes(
-            returned_buffer[..mem::size_of::<LONGLONG>()]
-                .try_into()
-                .unwrap(),
-        );
-        returned_buffer = &returned_buffer[mem::size_of::<LONGLONG>()..];
+        unknown => {
+            return Err(Error::UnknownAttributeTypeCode(unknown));
+        }
+    };
 
-        // Then, there's a list of tuples, each giving the starting LCN for the current
-        // extent and the VCN that starts the next extent.
-        let mut next_min_vcn = min_vcn;
+    Ok(attribute)
+}
 
-        for _ in 0..extent_count {
-            next_min_vcn = LONGLONG::from_le_bytes(
-                returned_buffer[..mem::size_of::<LONGLONG>()]
-                    .try_into()
-                    .unwrap(),
-            );
-            returned_buffer = &returned_buffer[mem::size_of::<LONGLONG>()..];
-
-            let min_lcn = LONGLONG::from_le_bytes(
-                returned_buffer[..mem::size_of::<LONGLONG>()]
-                    .try_into()
-                    .unwrap(),
-            );
-            returned_buffer = &returned_buffer[mem::size_of::<LONGLONG>()..];
-
-            result.push(Extent {
-                min_lcn,
-                min_vcn,
-                cluster_count: next_min_vcn - min_vcn,
-            });
-            min_vcn = next_min_vcn;
+fn parse_resident_attribute(
+    attrib_header: &sys::AttributeRecordHeader,
+    attribute_name: Option<String>,
+    attribute_data: &[u8],
+) -> Result<Attribute, Error> {
+    println!("attribute data: {:?}", attribute_data);
+    let attribute = match attrib_header.type_code {
+        sys::attribute_types::STANDARD_INFORMATION => {
+            let (attrib, _) = sys::StandardInformation::load(attribute_data);
+            Attribute::StandardInformation {
+                name: attribute_name,
+                created: parse_time(attrib.date_created)?,
+                modified: parse_time(attrib.date_modified)?,
+                mft_record_modified: parse_time(attrib.date_mft_record_modified)?,
+                accessed: parse_time(attrib.date_accessed)?,
+                flags: attrib.flags.into(),
+                max_versions: attrib.max_versions,
+                version_number: attrib.version_number,
+                class_id: attrib.class_id,
+                owner_id: attrib.owner_id,
+                security_id: attrib.security_id,
+                quota_charged: attrib.quota_charged,
+                update_sequence_number: attrib.update_sequence_number,
+            }
         }
 
-        current_starting_vcn = next_min_vcn;
-        if err != winerror::ERROR_MORE_DATA {
-            break;
+        sys::attribute_types::FILE_NAME => {
+            let (attrib, consumed) = sys::FileName::load(attribute_data);
+            let name_len = (attrib.filename_length * 2) as usize;
+            let filename_bytes = &attribute_data[consumed..consumed + name_len];
+            // Since we have no guarantees about the alignment of the buffer,
+            // we can't safely cast the array of u8's to an array of u16's.
+            let filename = {
+                let mut filename = vec![0u16; name_len / 2];
+                for i in 0..filename.len() {
+                    filename[i] =
+                        u16::from_le_bytes([filename_bytes[i * 2], filename_bytes[(i * 2) + 1]]);
+                }
+
+                OsString::from_wide(&filename[..])
+            };
+
+            Attribute::FileName {
+                name: attribute_name,
+                filename,
+                filename_type: match attrib.filename_type {
+                    sys::filename_types::POSIX => FileNameType::Posix,
+                    sys::filename_types::WIN32 => FileNameType::Win32,
+                    sys::filename_types::DOS => FileNameType::Dos,
+                    sys::filename_types::WIN32_DOS => FileNameType::Win32AndDos,
+                    unknown => return Err(Error::UnknownFilenameType(unknown)),
+                },
+                created: parse_time(attrib.date_created)?,
+                modified: parse_time(attrib.date_modified)?,
+                mft_record_modified: parse_time(attrib.date_mft_record_modified)?,
+                accessed: parse_time(attrib.date_accessed)?,
+                flags: attrib.flags.into(),
+                logical_size: attrib.logical_file_size,
+                physical_size: attrib.size_on_disk,
+                reparse_tag: attrib.reparse_tag,
+            }
         }
+
+        unknown => {
+            return Err(Error::UnknownAttributeTypeCode(unknown));
+        }
+    };
+
+    Ok(attribute)
+}
+
+fn parse_time(time: u64) -> Result<DateTime<Utc>, Error> {
+    let ftime = FILETIME {
+        dwLowDateTime: (time & 0xFFFF_FFFF).try_into().unwrap(),
+        dwHighDateTime: ((time & 0xFFFF_FFFF_0000_0000) >> 32).try_into().unwrap(),
+    };
+    let mut system_time = SYSTEMTIME::default();
+    let result = unsafe { FileTimeToSystemTime(&ftime, &mut system_time) };
+    if result == 0 {
+        let err_code = unsafe { ehapi::GetLastError() };
+        return Err(Error::TimeConversionFailure(err_code));
     }
 
-    Ok(result)
+    let local_result = Utc
+        .ymd_opt(
+            system_time.wYear.into(),
+            system_time.wMonth.into(),
+            system_time.wDay.into(),
+        )
+        .and_hms_milli_opt(
+            system_time.wHour.into(),
+            system_time.wMinute.into(),
+            system_time.wSecond.into(),
+            system_time.wMilliseconds.into(),
+        );
+
+    local_result.single().ok_or(Error::InvalidTimeRepr)
+}
+
+fn is_flag_set(data: u32, flag: u32) -> bool {
+    (data & flag) != 0
 }
