@@ -1,6 +1,7 @@
 use crate::{err::Error, SafeHandle};
 
 use chrono::{DateTime, TimeZone as _, Utc};
+use uuid::Uuid;
 use winapi::{
     shared::minwindef::FILETIME,
     um::{
@@ -21,7 +22,7 @@ use winapi::{
 use std::{
     convert::TryInto as _,
     ffi::{c_void, OsStr, OsString},
-    io::prelude::*,
+    io::{prelude::*, SeekFrom},
     mem,
     os::windows::ffi::{OsStrExt as _, OsStringExt as _},
     path::Path,
@@ -86,7 +87,7 @@ pub enum FileNameType {
 pub enum Attribute {
     // read-only, timestamps, hard link count, etc
     StandardInformation {
-        name: Option<String>,
+        name: Option<OsString>,
         created: DateTime<Utc>,
         modified: DateTime<Utc>,
         mft_record_modified: DateTime<Utc>,
@@ -95,20 +96,16 @@ pub enum Attribute {
         max_versions: u32,
         version_number: u32,
         class_id: u32,
-        owner_id: u32,
-        security_id: u32,
-        quota_charged: u64,
-        update_sequence_number: u64,
+        owner_id: Option<u32>,
+        security_id: Option<u32>,
+        quota_charged: Option<u64>,
+        update_sequence_number: Option<u64>,
     },
 
-    // list of attributes that make up the file
-    AttributeList {
-        name: Option<String>,
-    },
     // one of the names of the file
     FileName {
         // name OF THE ATTRIBUTE, not the file name
-        name: Option<String>,
+        name: Option<OsString>,
         filename: OsString,
         filename_type: FileNameType,
         created: DateTime<Utc>,
@@ -120,53 +117,81 @@ pub enum Attribute {
         physical_size: u64,
         reparse_tag: u32,
     },
-    // if present, a 64-bit identifier assigned by a link-tracking service
+
+    // if present, a 64-bit identifier used by .LNK files, and various other IDs
     ObjectId {
-        name: Option<String>,
+        name: Option<OsString>,
+        object_id: Option<Uuid>,
+        birth_volume_id: Option<Uuid>,
+        birth_object_id: Option<Uuid>,
+        domain_id: Option<Uuid>,
     },
+
     // volume label; only present on volume files
     VolumeName {
-        name: Option<String>,
+        name: Option<OsString>,
+        volume_name: OsString,
     },
+
     // only present on volume files
     VolumeInformation {
-        name: Option<String>,
+        name: Option<OsString>,
+        major_version: u8,
+        minor_version: u8,
+        is_dirty: bool,
+        resize_logfile: bool,
+        upgrade_on_mount: bool,
+        mounted_on_nt4: bool,
+        is_deleting_usn: bool,
+        repair_object_ids: bool,
+        chkdsk_flag: bool,
     },
+
     // actual file content
     Data {
-        name: Option<String>,
+        name: Option<OsString>,
         logical_size: u64,
         physical_size: u64,
     },
-    // used for filename allocation for large directories
-    IndexRoot {
-        name: Option<String>,
-    },
-    // used for filename allocation for large directories
-    IndexAllocation {
-        name: Option<String>,
-    },
+
+    // // used for filename allocation for large directories
+    // IndexRoot {
+    //     name: Option<OsString>,
+    // },
+    // // used for filename allocation for large directories
+    // IndexAllocation {
+    //     name: Option<OsString>,
+    // },
+
     // bitmap index for a large directory
     Bitmap {
-        name: Option<String>,
+        name: Option<OsString>,
         logical_size: u64,
         physical_size: u64,
     },
+
+    EaInformation {
+        name: Option<OsString>,
+        packed_size: u16,
+        unpacked_size: u32,
+        num_required: u16,
+    },
+
     // reparse data
     ReparsePoint {
-        name: Option<String>,
+        name: Option<OsString>,
     },
 }
 
 #[derive(Debug)]
 pub struct MftEntry {
     pub attributes: Vec<Attribute>,
-    pub is_file_name_index_present: bool,
 }
 
 pub struct MasterFileTable {
     mft_stream: read_volume::CheatingFileStream,
     segment_buffer: Vec<u8>,
+    bytes_per_file_record_segment: usize,
 }
 impl MasterFileTable {
     pub fn load(volume_handle: SafeHandle, volume_path: &OsStr) -> Result<Self, Error> {
@@ -189,6 +214,10 @@ impl MasterFileTable {
                 &mft_handle,
             )?,
             segment_buffer: vec![0; volume_data.BytesPerFileRecordSegment.try_into().unwrap()],
+            bytes_per_file_record_segment: volume_data
+                .BytesPerFileRecordSegment
+                .try_into()
+                .unwrap(),
         })
     }
 
@@ -207,106 +236,16 @@ impl Iterator for MasterFileTable {
                 Err(err) => return Some(Err(Error::ReadMftFailed(err))),
             }
 
-            let (segment_header, _) = sys::FileRecordSegmentHeader::load(&self.segment_buffer[..]);
-
-            if (segment_header.flags & sys::segment_header_flags::FILE_RECORD_SEGMENT_IN_USE) == 0 {
-                println!("Skipping non-used record segment");
-                continue;
+            match parse_segment(
+                &mut self.mft_stream,
+                self.bytes_per_file_record_segment,
+                false, // allow extensions
+                &self.segment_buffer[..],
+            ) {
+                Ok(Some(attributes)) => return Some(Ok(MftEntry { attributes })),
+                Ok(None) => continue,
+                Err(err) => return Some(Err(err)),
             }
-
-            if segment_header.base_file_record_segment.segment_number_low != 0
-                || segment_header.base_file_record_segment.segment_number_high != 0
-            {
-                // This is an extension of a previous record; skip it.
-                continue;
-            }
-
-            let mut attribute_buffer =
-                &self.segment_buffer[segment_header.first_attribute_offset as usize..];
-
-            let mut attribs = Vec::new();
-
-            loop {
-                let (attrib_header, consumed) = sys::AttributeRecordHeader::load(attribute_buffer);
-                // TODO: use AttributeList-type attributes to read extension FILE records.
-
-                // It looks like attribute names are some sort of ASCII, with one byte-per-character.
-                // The length is explicitly one byte and the maximum characters are 255, according to the docs.
-                // This means it's *probably* valid UTF-8.
-                let attribute_name = match attrib_header.name_length {
-                    0 => None,
-                    length => {
-                        println!("Reading attribute name!");
-                        let name_start: usize = attrib_header.name_offset.try_into().unwrap();
-                        let name_end: usize = name_start + length as usize;
-                        let name_buffer = &attribute_buffer[name_start..name_end];
-                        println!("name buffer: {:?}", String::from_utf8_lossy(name_buffer));
-                        Some(String::from_utf8_lossy(name_buffer).into_owned())
-                    }
-                };
-
-                match attrib_header.form_code {
-                    sys::form_codes::RESIDENT => {
-                        let (resident_header, _) =
-                            sys::AttributeRecordHeaderResident::load(&attribute_buffer[consumed..]);
-
-                        // The data is resident, so we don't need additional reads to get it.
-                        // value_offset measures from the beginning of the attribute record.
-                        let start_offset = resident_header.value_offset as usize;
-                        let end_offset = start_offset + resident_header.value_length as usize;
-                        let attribute_data = &attribute_buffer[start_offset..end_offset];
-
-                        match parse_resident_attribute(
-                            &attrib_header,
-                            attribute_name,
-                            attribute_data,
-                        ) {
-                            Ok(attrib) => {
-                                println!("got attrib: {:#?}", attrib);
-                                attribs.push(attrib);
-                            }
-                            Err(err) => return Some(Err(err)),
-                        }
-                    }
-                    sys::form_codes::NON_RESIDENT => {
-                        let (nonresident_header, _) = sys::AttributeRecordHeaderNonResident::load(
-                            &attribute_buffer[consumed..],
-                        );
-
-                        // We should never need to read non-resident data
-                        match parse_non_resident_attribute(
-                            &attrib_header,
-                            &nonresident_header,
-                            attribute_name,
-                        ) {
-                            Ok(attrib) => {
-                                println!("got attrib: {:#?}", attrib);
-                                attribs.push(attrib);
-                            }
-                            Err(err) => return Some(Err(err)),
-                        }
-                    }
-
-                    unknown => {
-                        return Some(Err(Error::UnknownFormCode(unknown)));
-                    }
-                };
-
-                attribute_buffer =
-                    &attribute_buffer[attrib_header.record_length.try_into().unwrap()..];
-                if attribute_buffer.len() <= 4 || attribute_buffer[0..4] == [0xFF, 0xFF, 0xFF, 0xFF]
-                {
-                    println!("Found end thing");
-                    break;
-                }
-            }
-
-            return Some(Ok(MftEntry {
-                attributes: attribs,
-                is_file_name_index_present: (segment_header.flags
-                    & sys::segment_header_flags::FILE_NAME_INDEX_PRESENT)
-                    != 0,
-            }));
         }
     }
 }
@@ -348,7 +287,7 @@ fn get_ntfs_volume_data(
         extended_volume_data_bytes.as_ptr() as *const NTFS_EXTENDED_VOLUME_DATA;
 
     // We want to be very explicit about this clone - these pointers don't currently
-    // have lifetimes known to rustc, so we have to follow them.
+    // have lifetimes known to rustc, so we have to copy the data on return.
     #[allow(clippy::clone_on_copy)]
     Ok((
         unsafe { *volume_data_buffer }.clone(),
@@ -391,29 +330,35 @@ fn get_mft_handle(volume_path: &OsStr) -> Result<SafeHandle, Error> {
 fn parse_non_resident_attribute(
     attrib_header: &sys::AttributeRecordHeader,
     non_resident_header: &sys::AttributeRecordHeaderNonResident,
-    attribute_name: Option<String>,
-) -> Result<Attribute, Error> {
-    println!(
-        "non-resident: {:#?} {:#?} {:?}",
-        attrib_header, non_resident_header, attribute_name
-    );
-
+    attribute_name: Option<OsString>,
+) -> Result<Option<Attribute>, Error> {
     let attribute = match attrib_header.type_code {
-        type_code @ sys::attribute_types::STANDARD_INFORMATION => {
+        type_code @ sys::attribute_types::STANDARD_INFORMATION
+        | type_code @ sys::attribute_types::OBJECT_ID
+        | type_code @ sys::attribute_types::VOLUME_NAME
+        | type_code @ sys::attribute_types::VOLUME_INFORMATION
+        | type_code @ sys::attribute_types::ATTRIBUTE_LIST
+        | type_code @ sys::attribute_types::EA_INFORMATION => {
             return Err(Error::UnsupportedNonResident(type_code))
         }
 
-        sys::attribute_types::DATA => Attribute::Data {
+        sys::attribute_types::DATA => Some(Attribute::Data {
             name: attribute_name,
             logical_size: non_resident_header.file_size,
             physical_size: non_resident_header.allocated_length,
-        },
+        }),
 
-        sys::attribute_types::BITMAP => Attribute::Bitmap {
+        sys::attribute_types::BITMAP => Some(Attribute::Bitmap {
             name: attribute_name,
             logical_size: non_resident_header.file_size,
             physical_size: non_resident_header.allocated_length,
-        },
+        }),
+
+        sys::attribute_types::SECURITY_DESCRIPTOR
+        | sys::attribute_types::INDEX_ROOT
+        | sys::attribute_types::INDEX_ALLOCATION
+        | sys::attribute_types::LOGGED_UTILITY_STREAM
+        | sys::attribute_types::EA => None,
 
         unknown => {
             return Err(Error::UnknownAttributeTypeCode(unknown));
@@ -425,14 +370,16 @@ fn parse_non_resident_attribute(
 
 fn parse_resident_attribute(
     attrib_header: &sys::AttributeRecordHeader,
-    attribute_name: Option<String>,
+    resident_header: &sys::AttributeRecordHeaderResident,
+    attribute_name: Option<OsString>,
+    stream: &mut read_volume::CheatingFileStream,
+    bytes_per_file_record_segment: usize,
     attribute_data: &[u8],
-) -> Result<Attribute, Error> {
-    println!("attribute data: {:?}", attribute_data);
+) -> Result<Vec<Attribute>, Error> {
     let attribute = match attrib_header.type_code {
         sys::attribute_types::STANDARD_INFORMATION => {
-            let (attrib, _) = sys::StandardInformation::load(attribute_data);
-            Attribute::StandardInformation {
+            let attrib = sys::StandardInformation::load(attribute_data)?;
+            vec![Attribute::StandardInformation {
                 name: attribute_name,
                 created: parse_time(attrib.date_created)?,
                 modified: parse_time(attrib.date_modified)?,
@@ -446,26 +393,17 @@ fn parse_resident_attribute(
                 security_id: attrib.security_id,
                 quota_charged: attrib.quota_charged,
                 update_sequence_number: attrib.update_sequence_number,
-            }
+            }]
         }
 
         sys::attribute_types::FILE_NAME => {
-            let (attrib, consumed) = sys::FileName::load(attribute_data);
+            let attrib = sys::FileName::load(attribute_data)?;
             let name_len = (attrib.filename_length * 2) as usize;
-            let filename_bytes = &attribute_data[consumed..consumed + name_len];
-            // Since we have no guarantees about the alignment of the buffer,
-            // we can't safely cast the array of u8's to an array of u16's.
-            let filename = {
-                let mut filename = vec![0u16; name_len / 2];
-                for i in 0..filename.len() {
-                    filename[i] =
-                        u16::from_le_bytes([filename_bytes[i * 2], filename_bytes[(i * 2) + 1]]);
-                }
+            let filename_bytes =
+                &attribute_data[sys::FILE_NAME_LENGTH..sys::FILE_NAME_LENGTH + name_len];
+            let filename = parse_string(filename_bytes);
 
-                OsString::from_wide(&filename[..])
-            };
-
-            Attribute::FileName {
+            vec![Attribute::FileName {
                 name: attribute_name,
                 filename,
                 filename_type: match attrib.filename_type {
@@ -483,8 +421,81 @@ fn parse_resident_attribute(
                 logical_size: attrib.logical_file_size,
                 physical_size: attrib.size_on_disk,
                 reparse_tag: attrib.reparse_tag,
-            }
+            }]
         }
+
+        sys::attribute_types::OBJECT_ID => {
+            let attrib = sys::ObjectId::load(attribute_data)?;
+            vec![Attribute::ObjectId {
+                name: attribute_name,
+                object_id: attrib.object_id.map(Uuid::from_guid).transpose()?,
+                birth_volume_id: attrib.birth_volume_id.map(Uuid::from_guid).transpose()?,
+                birth_object_id: attrib.birth_object_id.map(Uuid::from_guid).transpose()?,
+                domain_id: attrib.domain_id.map(Uuid::from_guid).transpose()?,
+            }]
+        }
+
+        sys::attribute_types::VOLUME_NAME => vec![Attribute::VolumeName {
+            name: attribute_name,
+            volume_name: parse_string(attribute_data),
+        }],
+
+        sys::attribute_types::VOLUME_INFORMATION => {
+            let attrib = sys::VolumeInformation::load(attribute_data)?;
+            vec![Attribute::VolumeInformation {
+                name: attribute_name,
+                major_version: attrib.major_version,
+                minor_version: attrib.minor_version,
+                is_dirty: is_flag_set16(attrib.flags, sys::volume_info_flags::DIRTY),
+                resize_logfile: is_flag_set16(attrib.flags, sys::volume_info_flags::RESIZE_LOGFILE),
+                upgrade_on_mount: is_flag_set16(
+                    attrib.flags,
+                    sys::volume_info_flags::UPGRADE_ON_MOUNT,
+                ),
+                mounted_on_nt4: is_flag_set16(attrib.flags, sys::volume_info_flags::MOUNTED_ON_NT4),
+                is_deleting_usn: is_flag_set16(attrib.flags, sys::volume_info_flags::DELETING_USN),
+                repair_object_ids: is_flag_set16(
+                    attrib.flags,
+                    sys::volume_info_flags::REPAIR_OBJECT_IDS,
+                ),
+                chkdsk_flag: is_flag_set16(attrib.flags, sys::volume_info_flags::CHKDSK_FLAG),
+            }]
+        }
+
+        // For resident DATA and BITMAP streams, we report physical size equal to the
+        // logical size.
+        sys::attribute_types::DATA => vec![Attribute::Data {
+            name: attribute_name,
+            logical_size: resident_header.value_length.into(),
+            physical_size: resident_header.value_length.into(),
+        }],
+
+        sys::attribute_types::BITMAP => vec![Attribute::Bitmap {
+            name: attribute_name,
+            logical_size: resident_header.value_length.into(),
+            physical_size: resident_header.value_length.into(),
+        }],
+
+        sys::attribute_types::EA_INFORMATION => {
+            let attrib = sys::EaInformation::load(attribute_data)?;
+            vec![Attribute::EaInformation {
+                name: attribute_name,
+                packed_size: attrib.size_packed,
+                unpacked_size: attrib.size_unpacked,
+                num_required: attrib.num_required,
+            }]
+        }
+
+        sys::attribute_types::ATTRIBUTE_LIST => {
+            println!(">>> RECURSING <<<");
+            parse_attribute_list(stream, bytes_per_file_record_segment, attribute_data)?
+        }
+
+        sys::attribute_types::SECURITY_DESCRIPTOR
+        | sys::attribute_types::INDEX_ROOT
+        | sys::attribute_types::INDEX_ALLOCATION
+        | sys::attribute_types::LOGGED_UTILITY_STREAM
+        | sys::attribute_types::EA => vec![],
 
         unknown => {
             return Err(Error::UnknownAttributeTypeCode(unknown));
@@ -494,9 +505,147 @@ fn parse_resident_attribute(
     Ok(attribute)
 }
 
+fn parse_segment(
+    stream: &mut read_volume::CheatingFileStream,
+    bytes_per_file_record_segment: usize,
+    allow_extensions: bool,
+    buf: &[u8],
+) -> Result<Option<Vec<Attribute>>, Error> {
+    let mut result = Vec::new();
+    let (segment_header, _) = sys::FileRecordSegmentHeader::load(&buf[..]);
+
+    if (segment_header.flags & sys::segment_header_flags::FILE_RECORD_SEGMENT_IN_USE) == 0 {
+        println!("Skipping non-used record segment");
+        return Ok(None);
+    }
+
+    if !allow_extensions
+        && ((segment_header.base_file_record_segment.segment_number_low != 0)
+            || (segment_header.base_file_record_segment.segment_number_high != 0))
+    {
+        // This is an extension of a previous record; skip it.
+        println!("Skipping extension record");
+        return Ok(None);
+    }
+
+    let mut attribute_buffer = &buf[segment_header.first_attribute_offset as usize..];
+
+    loop {
+        // println!("attribute: {:?}", attribute_buffer);
+        let (attrib_header, consumed) = sys::AttributeRecordHeader::load(attribute_buffer);
+
+        // Attribute names are WTF-16 but the maximum length is 255 *bytes*.
+        let attribute_name = match attrib_header.name_length {
+            0 => None,
+            pseudo_code_points => {
+                let name_start: usize = attrib_header.name_offset.try_into().unwrap();
+                let name_end: usize = name_start + (2 * pseudo_code_points) as usize;
+                let name_buffer = &attribute_buffer[name_start..name_end];
+                Some(parse_string(name_buffer))
+            }
+        };
+
+        match attrib_header.form_code {
+            sys::form_codes::RESIDENT => {
+                let (resident_header, _) =
+                    sys::AttributeRecordHeaderResident::load(&attribute_buffer[consumed..]);
+
+                // The data is resident, so we don't need additional reads to get it.
+                // value_offset measures from the beginning of the attribute record.
+                let start_offset = resident_header.value_offset as usize;
+                let end_offset = start_offset + resident_header.value_length as usize;
+                let attribute_data = &attribute_buffer[start_offset..end_offset];
+
+                result.extend(parse_resident_attribute(
+                    &attrib_header,
+                    &resident_header,
+                    attribute_name,
+                    stream,
+                    bytes_per_file_record_segment,
+                    attribute_data,
+                )?);
+            }
+            sys::form_codes::NON_RESIDENT => {
+                let (nonresident_header, _) =
+                    sys::AttributeRecordHeaderNonResident::load(&attribute_buffer[consumed..]);
+
+                match parse_non_resident_attribute(
+                    &attrib_header,
+                    &nonresident_header,
+                    attribute_name,
+                ) {
+                    Ok(Some(attrib)) => {
+                        result.push(attrib);
+                    }
+                    Ok(None) => println!(
+                        "Skipping non-resident attribute we don't care about: {:X}",
+                        attrib_header.type_code
+                    ),
+                    Err(err) => return Err(err),
+                }
+            }
+
+            unknown => {
+                return Err(Error::UnknownFormCode(unknown));
+            }
+        };
+
+        attribute_buffer = &attribute_buffer[attrib_header.record_length.try_into().unwrap()..];
+        if attribute_buffer.len() <= 4 || attribute_buffer[0..4] == [0xFF, 0xFF, 0xFF, 0xFF] {
+            break;
+        }
+    }
+
+    Ok(Some(result))
+}
+
+fn parse_attribute_list(
+    stream: &mut read_volume::CheatingFileStream,
+    bytes_per_file_record_segment: usize,
+    mut buf: &[u8],
+) -> Result<Vec<Attribute>, Error> {
+    println!("Parsing attribute list: {:?}", buf);
+    let mut result = Vec::with_capacity(buf.len() / sys::ATTRIBUTE_LIST_ENTRY_SIZE);
+    let mut segment_buf = vec![0; bytes_per_file_record_segment];
+    let cur_pos = stream.seek(SeekFrom::Current(0)).unwrap();
+
+    while !buf.is_empty() {
+        let attrib = sys::AttributeListEntry::load(buf)?;
+        buf = &buf[sys::ATTRIBUTE_LIST_ENTRY_SIZE..];
+
+        // We don't need the name here, so just skip it.
+        // The name is guaranteed to come immediately after the header, if present.
+        buf = &buf[attrib.name_length.try_into().unwrap()..];
+
+        // Seek to the new position
+        let target = (((attrib.segment_reference.segment_number_high as u64) << 16)
+            | attrib.segment_reference.segment_number_low as u64)
+            * bytes_per_file_record_segment as u64;
+        stream.seek(SeekFrom::Start(target)).unwrap();
+
+        // Read the segment
+        stream.read_exact(&mut segment_buf[..]).unwrap();
+
+        result.extend(
+            parse_segment(
+                stream,
+                bytes_per_file_record_segment,
+                true, // allow extensions
+                &segment_buf[..],
+            )?
+            .unwrap_or_default(),
+        );
+    }
+
+    // Restore the old position
+    stream.seek(SeekFrom::Start(cur_pos)).unwrap();
+
+    Ok(result)
+}
+
 fn parse_time(time: u64) -> Result<DateTime<Utc>, Error> {
     let ftime = FILETIME {
-        dwLowDateTime: (time & 0xFFFF_FFFF).try_into().unwrap(),
+        dwLowDateTime: (time & 0x0000_0000_FFFF_FFFF).try_into().unwrap(),
         dwHighDateTime: ((time & 0xFFFF_FFFF_0000_0000) >> 32).try_into().unwrap(),
     };
     let mut system_time = SYSTEMTIME::default();
@@ -522,6 +671,20 @@ fn parse_time(time: u64) -> Result<DateTime<Utc>, Error> {
     local_result.single().ok_or(Error::InvalidTimeRepr)
 }
 
+fn parse_string(utf16data: &[u8]) -> OsString {
+    // Since we have no guarantees about the alignment of the buffer,
+    // we can't safely cast the array of u8's to an array of u16's.
+    let mut filename = vec![0u16; utf16data.len() / 2];
+    for i in 0..filename.len() {
+        filename[i] = u16::from_le_bytes([utf16data[i * 2], utf16data[(i * 2) + 1]]);
+    }
+    OsString::from_wide(&filename[..])
+}
+
 fn is_flag_set(data: u32, flag: u32) -> bool {
+    (data & flag) != 0
+}
+
+fn is_flag_set16(data: u16, flag: u16) -> bool {
     (data & flag) != 0
 }

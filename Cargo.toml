@@ -9,6 +9,10 @@ edition = "2018"
 [dependencies.chrono]
 version = "0.4"
 
+[dependencies.uuid]
+version = "0.8"
+features = ["guid"] # enables parsing winapi GUIDs
+
 [dependencies.winapi]
 version = "0.3"
 features = [

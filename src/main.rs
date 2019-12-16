@@ -76,7 +76,7 @@ fn main() {
                     let mft = mft::MasterFileTable::load(handle, &volume.paths[0]).unwrap();
                     println!("Loaded MFT. Length: {}", mft.len());
                     for entry in mft {
-                        println!("entry: {:#?}", entry);
+                        println!("entry: {:#?}", entry.unwrap());
                     }
                 }
                 Err(err) => {

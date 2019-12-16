@@ -128,7 +128,7 @@ impl CheatingFileStream {
         self.buffer_valid_to = num_bytes_read.try_into().unwrap();
         self.current_extent_offset += num_bytes_read as i64;
 
-        if self.current_extent_offset > extent_to_read.cluster_count * self.bytes_per_cluster {
+        if self.current_extent_offset >= extent_to_read.cluster_count * self.bytes_per_cluster {
             self.current_extent += 1;
             self.current_extent_offset = 0;
         }
