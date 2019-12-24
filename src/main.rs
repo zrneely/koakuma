@@ -1,6 +1,4 @@
-// mod data;
 mod err;
-// mod journal;
 mod mft;
 mod privileges;
 mod volumes;
@@ -62,16 +60,6 @@ fn main() {
 
             match volume.get_handle() {
                 Ok(handle) => {
-                    // println!("Counting journal entries...");
-                    // let mft_iter = journal::JournalEntryIterator::new(handle);
-
-                    // let mut count = 0;
-                    // let time_taken = chrono::Duration::span(|| {
-                    //     count = mft_iter.map(|x| x.unwrap()).count();
-                    // });
-
-                    // println!("{} total MFT entries read in {:?}", count, time_taken);
-
                     println!("Reading MFT...");
                     let mft = mft::MasterFileTable::load(handle, &volume.paths[0]).unwrap();
                     println!(
