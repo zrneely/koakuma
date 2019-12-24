@@ -29,9 +29,9 @@ pub enum Error {
     OpenMftFailed(DWORD),
     GetRetrievalPointersFailed(DWORD),
     ReadVolumeFailed(DWORD),
+    ReadVolumeTooShort,
     MftHasNoExtents,
     MftStartLcnNotFirstExtent,
-    ReadMftFailed(std::io::Error),
     UnknownFormCode(u8),
     UnknownAttributeTypeCode(u32),
     UnknownFilenameType(u8),
@@ -43,6 +43,9 @@ pub enum Error {
     UnknownAttributeListEntrySize(usize),
     UnknownEaInformationSize(usize),
     GuidParseError(uuid::Error),
+    BadMultiSectorHeaderSignature,
+    UnknownReparseDataSize(usize),
+    UpdateSequenceValidationFailed,
 }
 impl From<NulError> for Error {
     fn from(err: NulError) -> Self {

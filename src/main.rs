@@ -74,10 +74,24 @@ fn main() {
 
                     println!("Reading MFT...");
                     let mft = mft::MasterFileTable::load(handle, &volume.paths[0]).unwrap();
-                    println!("Loaded MFT. Length: {}", mft.len());
+                    println!(
+                        "Loaded MFT. Length: {}; Entries: {}",
+                        mft.len(),
+                        mft.entry_count()
+                    );
+
+                    let mut entries = 0;
                     for entry in mft {
-                        println!("entry: {:#?}", entry.unwrap());
+                        let entry = entry.unwrap();
+                        entries += 1;
+
+                        if entries % 10000 == 0 {
+                            println!("Read {} entries...", entries);
+                            println!("Sample: {:#}", entry);
+                        }
                     }
+
+                    println!("Read {} entries total", entries);
                 }
                 Err(err) => {
                     println!("Failed to open volume handle: {:?}", err);

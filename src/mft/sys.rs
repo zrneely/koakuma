@@ -4,19 +4,26 @@ use winapi::shared::guiddef::GUID;
 
 use std::convert::TryInto as _;
 
+const MULTI_SECTOR_HEADER_SIGNATURE: [u8; 4] = [b'F', b'I', b'L', b'E'];
 pub struct MultiSectorHeader {
-    pub signature: [u8; 4], // should always be "FILE"
+    pub signature: [u8; 4],
     pub update_sequence_array_offset: u16,
     pub update_sequence_array_size: u16,
 }
+pub const MULTI_SECTOR_HEADER_LEN: usize = 8;
 impl MultiSectorHeader {
-    pub fn load(buf: &[u8]) -> (Self, usize) {
+    pub fn load(buf: &[u8]) -> Result<Self, Error> {
+        if buf[0..4] != MULTI_SECTOR_HEADER_SIGNATURE {
+            println!("Bad signature: {:?}", &buf[0..4]);
+            return Err(Error::BadMultiSectorHeaderSignature);
+        }
+
         let header = MultiSectorHeader {
             signature: [buf[0], buf[1], buf[2], buf[3]],
             update_sequence_array_offset: u16::from_le_bytes([buf[4], buf[5]]),
             update_sequence_array_size: u16::from_le_bytes([buf[6], buf[7]]),
         };
-        (header, 8)
+        Ok(header)
     }
 }
 
@@ -55,15 +62,11 @@ pub struct FileRecordSegmentHeader {
     pub mft_record_num: u32,
 }
 impl FileRecordSegmentHeader {
-    pub fn load(mut buf: &[u8]) -> (Self, usize) {
-        let start_buf_len = buf.len();
+    pub fn load(mut buf: &[u8]) -> Result<Self, Error> {
+        let multi_sector_header = MultiSectorHeader::load(buf)?;
+        buf = &buf[MULTI_SECTOR_HEADER_LEN..];
 
-        let (multi_sector_header, consumed) = MultiSectorHeader::load(buf);
-        buf = &buf[consumed..];
-
-        let log_file_sequence_number = u64::from_le_bytes([
-            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-        ]);
+        let log_file_sequence_number = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         buf = &buf[8..];
 
         let sequence_number = u16::from_le_bytes([buf[0], buf[1]]);
@@ -91,7 +94,7 @@ impl FileRecordSegmentHeader {
         buf = &buf[4..]; // skip 4 bytes, but only 2 are meaningful
 
         let mft_record_num = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        buf = &buf[4..];
+        // buf = &buf[4..];
 
         let header = FileRecordSegmentHeader {
             multi_sector_header,
@@ -107,7 +110,7 @@ impl FileRecordSegmentHeader {
             mft_record_num,
         };
 
-        (header, start_buf_len - buf.len())
+        Ok(header)
     }
 }
 
@@ -160,8 +163,8 @@ pub struct AttributeRecordHeader {
 impl AttributeRecordHeader {
     pub fn load(buf: &[u8]) -> (Self, usize) {
         let header = AttributeRecordHeader {
-            type_code: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
-            record_length: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            type_code: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            record_length: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
             form_code: buf[8],
             name_length: buf[9],
             name_offset: u16::from_le_bytes([buf[10], buf[11]]),
@@ -203,24 +206,14 @@ pub struct AttributeRecordHeaderNonResident {
 impl AttributeRecordHeaderNonResident {
     pub fn load(buf: &[u8]) -> (Self, usize) {
         let header = AttributeRecordHeaderNonResident {
-            lowest_vcn: u64::from_le_bytes([
-                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-            ]),
-            highest_vcn: u64::from_le_bytes([
-                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-            ]),
+            lowest_vcn: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            highest_vcn: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
             mapping_pairs_offset: u16::from_le_bytes([buf[16], buf[17]]),
             compression_unit_size: u16::from_le_bytes([buf[18], buf[19]]),
             // reserved: 0,
-            allocated_length: u64::from_le_bytes([
-                buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
-            ]),
-            file_size: u64::from_le_bytes([
-                buf[32], buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
-            ]),
-            valid_data_length: u64::from_le_bytes([
-                buf[40], buf[41], buf[42], buf[43], buf[44], buf[45], buf[46], buf[47],
-            ]),
+            allocated_length: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+            file_size: u64::from_le_bytes(buf[32..40].try_into().unwrap()),
+            valid_data_length: u64::from_le_bytes(buf[40..48].try_into().unwrap()),
         };
 
         (header, 48)
@@ -499,6 +492,40 @@ impl EaInformation {
     }
 }
 
+pub mod reparse_tag_flags {
+    pub const IS_ALIAS: u32 = 0x2000_0000;
+    pub const IS_HIGH_LATENCY: u32 = 0x4000_0000;
+    pub const IS_MICROSOFT: u32 = 0x8000_0000;
+}
+
+pub struct ReparsePoint {
+    pub tag: u32,
+    pub length: u16,
+    pub guid: Option<GUID>,
+}
+impl ReparsePoint {
+    pub fn load(buf: &[u8]) -> Result<Self, Error> {
+        if buf.len() < 8 {
+            return Err(Error::UnknownReparseDataSize(buf.len()));
+        }
+
+        let tag = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let length = u16::from_le_bytes(buf[4..6].try_into().unwrap());
+        let guid = if (tag & reparse_tag_flags::IS_MICROSOFT) == 0 {
+            Some(GUID {
+                Data1: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+                Data2: u16::from_le_bytes(buf[12..14].try_into().unwrap()),
+                Data3: u16::from_le_bytes(buf[14..16].try_into().unwrap()),
+                Data4: buf[16..24].try_into().unwrap(),
+            })
+        } else {
+            None
+        };
+
+        Ok(ReparsePoint { tag, length, guid })
+    }
+}
+
 pub struct AttributeListEntry {
     pub type_code: u32,
     pub record_length: u16,
@@ -508,10 +535,11 @@ pub struct AttributeListEntry {
     pub segment_reference: FileReference,
     pub instance: u16,
 }
-pub const ATTRIBUTE_LIST_ENTRY_SIZE: usize = 26;
+pub const EXPECTED_ATTRIBUTE_LIST_ENTRY_SIZE: usize = 32;
+pub const MIN_ATTRIBUTE_LIST_ENTRY_SIZE: usize = 26;
 impl AttributeListEntry {
     pub fn load(buf: &[u8]) -> Result<Self, Error> {
-        if buf.len() < ATTRIBUTE_LIST_ENTRY_SIZE {
+        if buf.len() < MIN_ATTRIBUTE_LIST_ENTRY_SIZE {
             return Err(Error::UnknownAttributeListEntrySize(buf.len()));
         }
 
