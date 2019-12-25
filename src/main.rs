@@ -68,18 +68,22 @@ fn main() {
                         mft.entry_count()
                     );
 
-                    let mut entries = 0;
-                    for entry in mft {
-                        let entry = entry.unwrap();
-                        entries += 1;
+                    println!(
+                        "Enumerated all entries in {:?}",
+                        chrono::Duration::span(|| {
+                            let mut entries = 0;
+                            for entry in mft {
+                                let entry = entry.unwrap();
+                                entries += 1;
 
-                        if entries % 10000 == 0 {
-                            println!("Read {} entries...", entries);
-                            println!("Sample: {:#}", entry);
-                        }
-                    }
+                                if entries % 10000 == 0 {
+                                    println!("Read {} entries...", entries);
+                                }
+                            }
 
-                    println!("Read {} entries total", entries);
+                            println!("Read {} entries total", entries);
+                        })
+                    );
                 }
                 Err(err) => {
                     println!("Failed to open volume handle: {:?}", err);

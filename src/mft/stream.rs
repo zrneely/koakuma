@@ -73,7 +73,11 @@ impl MftStream {
     pub fn read_clusters(&self, lcn: u64, count: u64, buf: &mut [u8]) -> Result<(), Error> {
         debug_assert_eq!(buf.len() as u64, count * self.bytes_per_cluster);
 
-        println!("reading from {:X}", lcn * self.bytes_per_cluster);
+        #[cfg(debug_assertions)]
+        {
+            println!("reading from {:X}", lcn * self.bytes_per_cluster);
+        }
+
         self.read_volume(lcn * self.bytes_per_cluster, buf)
     }
 
