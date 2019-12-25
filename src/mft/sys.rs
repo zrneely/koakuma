@@ -1,8 +1,16 @@
-use crate::err::Error;
+use crate::{
+    err::Error,
+    mft::{parse_segment_number, parse_string},
+};
 
-use winapi::shared::guiddef::GUID;
+use chrono::{DateTime, TimeZone as _, Utc};
+use uuid::Uuid;
+use winapi::{
+    shared::{guiddef::GUID, minwindef::FILETIME},
+    um::{errhandlingapi as ehapi, minwinbase::SYSTEMTIME, timezoneapi::FileTimeToSystemTime},
+};
 
-use std::convert::TryInto as _;
+use std::{convert::TryInto as _, ffi::OsString};
 
 const MULTI_SECTOR_HEADER_SIGNATURE: [u8; 4] = [b'F', b'I', b'L', b'E'];
 pub struct MultiSectorHeader {
@@ -220,7 +228,7 @@ impl AttributeRecordHeaderNonResident {
     }
 }
 
-pub mod standard_info_flags {
+mod standard_info_flags {
     pub const READ_ONLY: u32 = 0x0001;
     pub const HIDDEN: u32 = 0x0002;
     pub const SYSTEM: u32 = 0x0004;
@@ -238,7 +246,7 @@ pub mod standard_info_flags {
     pub const INDEX_VIEW: u32 = 0x2000_0000;
 }
 
-pub mod filename_types {
+mod filename_types {
     // up to 255 WTF-16 "code points"; case sensitive; only NUL and / aren't allowed.
     pub const POSIX: u8 = 0;
     // up to 255 WTF-16 "code points"; case insensitive; these characters aren't allowed:
@@ -251,260 +259,183 @@ pub mod filename_types {
     pub const WIN32_DOS: u8 = 3;
 }
 
-// note: the fields of this, except parent_directory, are only updated by
-// windows when the file's name changes.
-pub struct FileName {
-    pub parent_directory: FileReference,
-    pub date_created: u64,
-    pub date_modified: u64,
-    pub date_mft_record_modified: u64,
-    pub date_accessed: u64,
-    pub logical_file_size: u64,
-    pub size_on_disk: u64,
-    pub flags: u32, // the same as the standard info flags
-    pub reparse_tag: u32,
-    pub filename_length: u8,
-    pub filename_type: u8,
+#[derive(Debug)]
+pub struct StandardFlags {
+    pub is_read_only: bool,
+    pub is_hidden: bool,
+    pub is_system: bool,
+    pub is_archive: bool,
+    pub is_device: bool,
+    pub is_normal: bool,
+    pub is_temporary: bool,
+    pub is_sparse: bool,
+    pub is_reparse_point: bool,
+    pub is_compressed: bool,
+    pub is_offline: bool,
+    pub is_not_indexed: bool,
+    pub is_encrypted: bool,
+    pub is_directory: bool,
+    pub is_index_view: bool,
 }
+impl From<u32> for StandardFlags {
+    fn from(flags: u32) -> Self {
+        StandardFlags {
+            is_read_only: is_flag_set(flags, standard_info_flags::READ_ONLY),
+            is_hidden: is_flag_set(flags, standard_info_flags::HIDDEN),
+            is_system: is_flag_set(flags, standard_info_flags::SYSTEM),
+            is_archive: is_flag_set(flags, standard_info_flags::ARCHIVE),
+            is_device: is_flag_set(flags, standard_info_flags::DEVICE),
+            is_normal: is_flag_set(flags, standard_info_flags::NORMAL),
+            is_temporary: is_flag_set(flags, standard_info_flags::TEMPORARY),
+            is_sparse: is_flag_set(flags, standard_info_flags::SPARSE),
+            is_reparse_point: is_flag_set(flags, standard_info_flags::REPARSE_POINT),
+            is_compressed: is_flag_set(flags, standard_info_flags::COMPRESSED),
+            is_offline: is_flag_set(flags, standard_info_flags::OFFLINE),
+            is_not_indexed: is_flag_set(flags, standard_info_flags::NOT_INDEXED),
+            is_encrypted: is_flag_set(flags, standard_info_flags::ENCRYPTED),
+            is_directory: is_flag_set(flags, standard_info_flags::DIRECTORY),
+            is_index_view: is_flag_set(flags, standard_info_flags::INDEX_VIEW),
+        }
+    }
+}
+
+// read-only, timestamps, hard link count, etc
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct StandardInformation {
+    pub name: Option<OsString>,
+    pub created: DateTime<Utc>,
+    pub modified: DateTime<Utc>,
+    pub mft_record_modified: DateTime<Utc>,
+    pub accessed: DateTime<Utc>,
+    pub flags: StandardFlags,
+}
+impl StandardInformation {
+    pub fn load(buf: &[u8], name: Option<OsString>) -> Result<Self, Error> {
+        if buf.len() != 72 && buf.len() != 48 {
+            return Err(Error::UnknownStandardInformationSize(buf.len()));
+        }
+
+        Ok(StandardInformation {
+            name,
+            created: parse_time(u64::from_le_bytes(buf[0..8].try_into().unwrap()))?,
+            modified: parse_time(u64::from_le_bytes(buf[8..16].try_into().unwrap()))?,
+            mft_record_modified: parse_time(u64::from_le_bytes(buf[16..24].try_into().unwrap()))?,
+            accessed: parse_time(u64::from_le_bytes(buf[24..32].try_into().unwrap()))?,
+            flags: u32::from_le_bytes(buf[32..36].try_into().unwrap()).into(),
+        })
+    }
+}
+
 pub const FILE_NAME_LENGTH: usize = 66; // sizeof(FileName)
+
+#[derive(Debug, PartialEq)]
+pub enum FileNameType {
+    Posix,
+    Win32,
+    Dos,
+    Win32AndDos,
+}
+
+// One of the names of the file.
+// Note: the fields of this, except parent, are only updated by
+// Windows when the file's name changes.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct FileName {
+    // name OF THE ATTRIBUTE, not the file name
+    pub name: Option<OsString>,
+    pub filename: OsString,
+    pub filename_type: FileNameType,
+    pub parent: u64,
+    pub created: DateTime<Utc>,
+    pub modified: DateTime<Utc>,
+    pub mft_record_modified: DateTime<Utc>,
+    pub accessed: DateTime<Utc>,
+    pub flags: StandardFlags,
+    pub logical_size: u64,
+    pub physical_size: u64,
+    pub reparse_tag: u32,
+}
 impl FileName {
-    pub fn load(buf: &[u8]) -> Result<Self, Error> {
+    pub fn load(buf: &[u8], name: Option<OsString>) -> Result<Self, Error> {
         if buf.len() < (FILE_NAME_LENGTH + 2) {
             return Err(Error::UnknownFilenameSize(buf.len()));
         }
 
-        let parent_directory = FileReference::load(&buf[..8]);
-        let filename = FileName {
-            parent_directory,
-            date_created: u64::from_le_bytes([
-                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-            ]),
-            date_modified: u64::from_le_bytes([
-                buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-            ]),
-            date_mft_record_modified: u64::from_le_bytes([
-                buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
-            ]),
-            date_accessed: u64::from_le_bytes([
-                buf[32], buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
-            ]),
-            logical_file_size: u64::from_le_bytes([
-                buf[40], buf[41], buf[42], buf[43], buf[44], buf[45], buf[46], buf[47],
-            ]),
-            size_on_disk: u64::from_le_bytes([
-                buf[48], buf[49], buf[50], buf[51], buf[52], buf[53], buf[54], buf[55],
-            ]),
-            flags: u32::from_le_bytes([buf[56], buf[57], buf[58], buf[59]]),
-            reparse_tag: u32::from_le_bytes([buf[60], buf[61], buf[62], buf[63]]),
-            filename_length: buf[64],
-            filename_type: buf[65],
-        };
+        let name_len: usize = buf[64].into();
+        let name_len = name_len * 2;
+        let filename_bytes = &buf[FILE_NAME_LENGTH..FILE_NAME_LENGTH + name_len];
+        let filename = parse_string(filename_bytes);
 
-        Ok(filename)
-    }
-}
-
-pub struct StandardInformation {
-    pub date_created: u64, // timestamps are "number of 100 ns intervals since Jan 1, 1601 UTC"
-    pub date_modified: u64,
-    pub date_mft_record_modified: u64,
-    pub date_accessed: u64,
-    pub flags: u32,
-    pub max_versions: u32,
-    pub version_number: u32,
-    pub class_id: u32,
-    pub owner_id: Option<u32>,
-    pub security_id: Option<u32>,
-    pub quota_charged: Option<u64>,
-    pub update_sequence_number: Option<u64>,
-}
-impl StandardInformation {
-    pub fn load(buf: &[u8]) -> Result<Self, Error> {
-        let info = match buf.len() {
-            72 => StandardInformation {
-                date_created: u64::from_le_bytes([
-                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-                ]),
-                date_modified: u64::from_le_bytes([
-                    buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-                ]),
-                date_mft_record_modified: u64::from_le_bytes([
-                    buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-                ]),
-                date_accessed: u64::from_le_bytes([
-                    buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
-                ]),
-                flags: u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]),
-                max_versions: u32::from_le_bytes([buf[36], buf[37], buf[38], buf[39]]),
-                version_number: u32::from_le_bytes([buf[40], buf[41], buf[42], buf[43]]),
-                class_id: u32::from_le_bytes([buf[44], buf[45], buf[46], buf[47]]),
-                owner_id: Some(u32::from_le_bytes([buf[48], buf[49], buf[50], buf[51]])),
-                security_id: Some(u32::from_le_bytes([buf[52], buf[53], buf[54], buf[55]])),
-                quota_charged: Some(u64::from_le_bytes([
-                    buf[56], buf[57], buf[58], buf[59], buf[60], buf[61], buf[62], buf[63],
-                ])),
-                update_sequence_number: Some(u64::from_le_bytes([
-                    buf[64], buf[65], buf[66], buf[67], buf[68], buf[69], buf[70], buf[71],
-                ])),
+        Ok(FileName {
+            name,
+            filename,
+            filename_type: match buf[65] {
+                filename_types::POSIX => FileNameType::Posix,
+                filename_types::WIN32 => FileNameType::Win32,
+                filename_types::DOS => FileNameType::Dos,
+                filename_types::WIN32_DOS => FileNameType::Win32AndDos,
+                unknown => return Err(Error::UnknownFilenameType(unknown)),
             },
-            48 => StandardInformation {
-                date_created: u64::from_le_bytes([
-                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-                ]),
-                date_modified: u64::from_le_bytes([
-                    buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-                ]),
-                date_mft_record_modified: u64::from_le_bytes([
-                    buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-                ]),
-                date_accessed: u64::from_le_bytes([
-                    buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
-                ]),
-                flags: u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]),
-                max_versions: u32::from_le_bytes([buf[36], buf[37], buf[38], buf[39]]),
-                version_number: u32::from_le_bytes([buf[40], buf[41], buf[42], buf[43]]),
-                class_id: u32::from_le_bytes([buf[44], buf[45], buf[46], buf[47]]),
-                owner_id: None,
-                security_id: None,
-                quota_charged: None,
-                update_sequence_number: None,
-            },
-            unknown => return Err(Error::UnknownStandardInformationSize(unknown)),
-        };
-
-        Ok(info)
-    }
-}
-
-pub struct ObjectId {
-    pub object_id: Option<GUID>,
-    pub birth_volume_id: Option<GUID>,
-    pub birth_object_id: Option<GUID>,
-    pub domain_id: Option<GUID>,
-}
-impl ObjectId {
-    pub fn load(buf: &[u8]) -> Result<Self, Error> {
-        match buf.len() {
-            0 | 16 | 32 | 48 | 64..=256 => {}
-            unknown => return Err(Error::UnknownObjectIdSize(unknown)),
-        }
-
-        let object_id = if buf.len() >= 16 {
-            Some(GUID {
-                Data1: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
-                Data2: u16::from_le_bytes([buf[4], buf[5]]),
-                Data3: u16::from_le_bytes([buf[6], buf[7]]),
-                Data4: buf[8..16].try_into().unwrap(),
-            })
-        } else {
-            None
-        };
-
-        let birth_volume_id = if buf.len() >= 32 {
-            Some(GUID {
-                Data1: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
-                Data2: u16::from_le_bytes([buf[20], buf[21]]),
-                Data3: u16::from_le_bytes([buf[22], buf[23]]),
-                Data4: buf[24..32].try_into().unwrap(),
-            })
-        } else {
-            None
-        };
-
-        let birth_object_id = if buf.len() >= 48 {
-            Some(GUID {
-                Data1: u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]),
-                Data2: u16::from_le_bytes([buf[36], buf[37]]),
-                Data3: u16::from_le_bytes([buf[38], buf[39]]),
-                Data4: buf[40..48].try_into().unwrap(),
-            })
-        } else {
-            None
-        };
-
-        let domain_id = if buf.len() >= 64 {
-            Some(GUID {
-                Data1: u32::from_le_bytes([buf[48], buf[49], buf[50], buf[51]]),
-                Data2: u16::from_le_bytes([buf[52], buf[53]]),
-                Data3: u16::from_le_bytes([buf[54], buf[55]]),
-                Data4: buf[56..64].try_into().unwrap(),
-            })
-        } else {
-            None
-        };
-
-        Ok(ObjectId {
-            object_id,
-            birth_volume_id,
-            birth_object_id,
-            domain_id,
+            parent: parse_segment_number(&FileReference::load(&buf[0..8])),
+            created: parse_time(u64::from_le_bytes(buf[8..16].try_into().unwrap()))?,
+            modified: parse_time(u64::from_le_bytes(buf[16..24].try_into().unwrap()))?,
+            mft_record_modified: parse_time(u64::from_le_bytes(buf[24..32].try_into().unwrap()))?,
+            accessed: parse_time(u64::from_le_bytes(buf[32..40].try_into().unwrap()))?,
+            logical_size: u64::from_le_bytes(buf[40..48].try_into().unwrap()),
+            physical_size: u64::from_le_bytes(buf[48..56].try_into().unwrap()),
+            flags: u32::from_le_bytes(buf[56..60].try_into().unwrap()).into(),
+            reparse_tag: u32::from_le_bytes(buf[60..64].try_into().unwrap()),
         })
     }
 }
 
-pub mod volume_info_flags {
-    pub const DIRTY: u16 = 0x0001; // tells windows to do chkdsk /F on next boot
-    pub const RESIZE_LOGFILE: u16 = 0x0002;
-    pub const UPGRADE_ON_MOUNT: u16 = 0x0004;
-    pub const MOUNTED_ON_NT4: u16 = 0x0008;
-    pub const DELETING_USN: u16 = 0x0010;
-    pub const REPAIR_OBJECT_IDS: u16 = 0x0020;
-    pub const CHKDSK_FLAG: u16 = 0x8000;
+#[derive(Debug)]
+pub struct DataRun {
+    pub starting_lcn: i64,
+    pub cluster_count: u64,
 }
 
-pub struct VolumeInformation {
-    // reserved: u64,
-    pub major_version: u8,
-    pub minor_version: u8,
-    pub flags: u16,
-    // reserved: u32,
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct Data {
+    pub name: Option<OsString>,
+    pub logical_size: u64,
+    pub physical_size: u64,
+    pub runs: Option<Vec<DataRun>>,
 }
-impl VolumeInformation {
-    pub fn load(buf: &[u8]) -> Result<Self, Error> {
-        if buf.len() != 12 {
-            return Err(Error::UnknownVolumeInformationSize(buf.len()));
+impl Data {
+    pub fn compute_allocated_size_bytes(&self, bytes_per_cluster: u64) -> u64 {
+        let mut total_size = 0;
+        if let Some(ref runs) = self.runs {
+            for run in runs {
+                total_size += run.cluster_count;
+            }
         }
-
-        Ok(VolumeInformation {
-            major_version: buf[8],
-            minor_version: buf[9],
-            flags: u16::from_le_bytes(buf[10..12].try_into().unwrap()),
-        })
+        total_size * bytes_per_cluster
     }
 }
 
-pub struct EaInformation {
-    pub size_packed: u16,
-    pub num_required: u16,
-    pub size_unpacked: u32,
-}
-impl EaInformation {
-    pub fn load(buf: &[u8]) -> Result<Self, Error> {
-        if buf.len() != 8 {
-            return Err(Error::UnknownEaInformationSize(buf.len()));
-        }
-
-        Ok(EaInformation {
-            size_packed: u16::from_le_bytes(buf[0..2].try_into().unwrap()),
-            num_required: u16::from_le_bytes(buf[2..4].try_into().unwrap()),
-            size_unpacked: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
-        })
-    }
-}
-
-pub mod reparse_tag_flags {
+mod reparse_tag_flags {
     pub const IS_ALIAS: u32 = 0x2000_0000;
     pub const IS_HIGH_LATENCY: u32 = 0x4000_0000;
     pub const IS_MICROSOFT: u32 = 0x8000_0000;
 }
 
+#[derive(Debug)]
+#[non_exhaustive]
 pub struct ReparsePoint {
+    pub name: Option<OsString>,
     pub tag: u32,
     pub length: u16,
-    pub guid: Option<GUID>,
+    pub guid: Option<Uuid>,
+    pub is_alias: bool,
+    pub is_high_latency: bool,
+    pub is_microsoft: bool,
 }
 impl ReparsePoint {
-    pub fn load(buf: &[u8]) -> Result<Self, Error> {
+    pub fn load(buf: &[u8], name: Option<OsString>) -> Result<Self, Error> {
         if buf.len() < 8 {
             return Err(Error::UnknownReparseDataSize(buf.len()));
         }
@@ -522,7 +453,15 @@ impl ReparsePoint {
             None
         };
 
-        Ok(ReparsePoint { tag, length, guid })
+        Ok(ReparsePoint {
+            name,
+            tag,
+            length,
+            guid: guid.map(Uuid::from_guid).transpose()?,
+            is_alias: is_flag_set(tag, reparse_tag_flags::IS_ALIAS),
+            is_high_latency: is_flag_set(tag, reparse_tag_flags::IS_HIGH_LATENCY),
+            is_microsoft: is_flag_set(tag, reparse_tag_flags::IS_MICROSOFT),
+        })
     }
 }
 
@@ -535,7 +474,6 @@ pub struct AttributeListEntry {
     pub segment_reference: FileReference,
     pub instance: u16,
 }
-pub const EXPECTED_ATTRIBUTE_LIST_ENTRY_SIZE: usize = 32;
 pub const MIN_ATTRIBUTE_LIST_ENTRY_SIZE: usize = 26;
 impl AttributeListEntry {
     pub fn load(buf: &[u8]) -> Result<Self, Error> {
@@ -553,4 +491,36 @@ impl AttributeListEntry {
             instance: u16::from_le_bytes(buf[24..26].try_into().unwrap()),
         })
     }
+}
+
+fn parse_time(time: u64) -> Result<DateTime<Utc>, Error> {
+    let ftime = FILETIME {
+        dwLowDateTime: (time & 0x0000_0000_FFFF_FFFF).try_into().unwrap(),
+        dwHighDateTime: ((time & 0xFFFF_FFFF_0000_0000) >> 32).try_into().unwrap(),
+    };
+    let mut system_time = SYSTEMTIME::default();
+    let result = unsafe { FileTimeToSystemTime(&ftime, &mut system_time) };
+    if result == 0 {
+        let err_code = unsafe { ehapi::GetLastError() };
+        return Err(Error::TimeConversionFailure(err_code));
+    }
+
+    let local_result = Utc
+        .ymd_opt(
+            system_time.wYear.into(),
+            system_time.wMonth.into(),
+            system_time.wDay.into(),
+        )
+        .and_hms_milli_opt(
+            system_time.wHour.into(),
+            system_time.wMinute.into(),
+            system_time.wSecond.into(),
+            system_time.wMilliseconds.into(),
+        );
+
+    local_result.single().ok_or(Error::InvalidTimeRepr)
+}
+
+fn is_flag_set(data: u32, flag: u32) -> bool {
+    (data & flag) != 0
 }
