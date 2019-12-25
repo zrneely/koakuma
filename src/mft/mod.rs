@@ -736,7 +736,7 @@ impl Iterator for MasterFileTable {
 
         // We loop until we read a record that's in use and is not an extension of a previous one.
         loop {
-            if self.next_file_record_segment > self.mft_stream.get_file_record_segment_count() {
+            if self.next_file_record_segment >= self.mft_stream.get_file_record_segment_count() {
                 break None;
             }
 

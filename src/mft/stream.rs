@@ -94,7 +94,7 @@ impl MftStream {
             loop {
                 let extent = &self.extents[extent_idx];
                 let extent_len = extent.cluster_count as u64 * self.bytes_per_cluster;
-                if extent_len > target_offset {
+                if target_offset < extent_len {
                     // We found the correct extent!
                     let extent_start_lcn = extent.min_lcn as u64;
 
@@ -116,6 +116,10 @@ impl MftStream {
                 }
 
                 if extent_idx >= self.extents.len() {
+                    println!(
+                        "WHOOPS: {:#?} {} {}",
+                        self.extents, self.bytes_per_file_record_segment, segment,
+                    );
                     break None;
                 }
             }
