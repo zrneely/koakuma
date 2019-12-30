@@ -65,8 +65,6 @@ pub struct MasterFileTable {
     bytes_per_sector: u64,
     bytes_per_cluster: u64,
     current_file_record_segment: u64,
-    // This can vary from index to index
-    // bytes_per_index_record: u64,
 }
 impl MasterFileTable {
     pub fn load(volume_handle: SafeHandle, volume_path: &OsStr) -> Result<(Self, u64), Error> {
@@ -89,7 +87,6 @@ impl MasterFileTable {
                 bytes_per_sector: volume_data.BytesPerSector.into(),
                 bytes_per_cluster: volume_data.BytesPerCluster.into(),
                 current_file_record_segment: 0,
-                // bytes_per_index_record: sys::DEFAULT_BYTES_PER_INDEX_RECORD,
             },
             volume_data.BytesPerCluster.into(),
         ))
@@ -344,8 +341,11 @@ impl MasterFileTable {
 
         for segment_to_read in record_segments {
             // Read the segment
-            self.mft_stream
-                .read_file_record_segment(segment_to_read, &mut segment_buf[..])?;
+            self.mft_stream.read_file_record_segment(
+                segment_to_read,
+                &mut segment_buf[..],
+                false, // use_cache
+            )?;
             let segment_header = sys::FileRecordSegmentHeader::load(&segment_buf[..])?
                 .ok_or(Error::AttributeListPointedToUnusedFileRecord)?;
             self.fix_record_with_update_sequence(
@@ -452,6 +452,7 @@ impl MasterFileTable {
                 run.starting_lcn as u64,
                 run.cluster_count,
                 &mut buffer[cur_buf_offset..end_offset],
+                false, // use_cache
             )?;
 
             cur_buf_offset += (self.bytes_per_cluster * run.cluster_count) as usize;
@@ -468,16 +469,15 @@ impl Iterator for MasterFileTable {
 
         // We loop until we read a record that's in use and is not an extension of a previous one.
         loop {
-            // self.bytes_per_index_record = sys::DEFAULT_BYTES_PER_INDEX_RECORD;
-
             if self.current_file_record_segment >= self.mft_stream.get_file_record_segment_count() {
                 break None;
             }
 
-            match self
-                .mft_stream
-                .read_file_record_segment(self.current_file_record_segment, &mut segment_buffer[..])
-            {
+            match self.mft_stream.read_file_record_segment(
+                self.current_file_record_segment,
+                &mut segment_buffer[..],
+                true, // use_cache
+            ) {
                 Ok(_) => {}
                 Err(err) => break Some(Err(err)),
             }

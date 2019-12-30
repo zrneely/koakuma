@@ -35,7 +35,7 @@ pub struct MftStream {
     extents: Vec<Extent>,
 
     buffer: Vec<u8>,
-    buffer_offset: u64, // into the volume
+    buffer_offset: u64, // into the volume, in bytes
 }
 impl MftStream {
     pub fn new(
@@ -63,11 +63,8 @@ impl MftStream {
                 .try_into()
                 .unwrap(),
             extents,
-            // Keep a 4 MB buffer. Experimentation, at least on my device,
-            // has shown this to be a good balance between reducing ReadFile
-            // calls when reading sequential records and not taking to long
-            // on extra ReadFile calls when reading non-resident data.
-            buffer: vec![0; 4 * 1024 * 1024],
+            // 16 MB is a reasonable tradeoff between perf and memory usage
+            buffer: vec![0; 16 * 1024 * 1024],
             buffer_offset: 0,
         })
     }
@@ -76,12 +73,23 @@ impl MftStream {
         self.len / self.bytes_per_file_record_segment
     }
 
-    pub fn read_clusters(&mut self, lcn: u64, count: u64, buf: &mut [u8]) -> Result<(), Error> {
+    pub fn read_clusters(
+        &mut self,
+        lcn: u64,
+        count: u64,
+        buf: &mut [u8],
+        use_cache: bool,
+    ) -> Result<(), Error> {
         debug_assert_eq!(buf.len() as u64, count * self.bytes_per_cluster);
-        self.read_volume(lcn * self.bytes_per_cluster, buf)
+        self.read_volume(lcn * self.bytes_per_cluster, buf, use_cache)
     }
 
-    pub fn read_file_record_segment(&mut self, segment: u64, buf: &mut [u8]) -> Result<(), Error> {
+    pub fn read_file_record_segment(
+        &mut self,
+        segment: u64,
+        buf: &mut [u8],
+        use_cache: bool,
+    ) -> Result<(), Error> {
         debug_assert_eq!(0, self.len % self.bytes_per_file_record_segment);
         debug_assert_eq!(buf.len() as u64, self.bytes_per_file_record_segment);
 
@@ -97,18 +105,6 @@ impl MftStream {
                 if target_offset < extent_len {
                     // We found the correct extent!
                     let extent_start_lcn = extent.min_lcn as u64;
-
-                    // #[cfg(debug_assertions)]
-                    // {
-                    //     println!(
-                    //         "reading segment {} from extent {} (starting lcn: 0x{:X}, offset: 0x{:X})",
-                    //         segment,
-                    //         extent_idx,
-                    //         extent_start_lcn,
-                    //         (extent_start_lcn * self.bytes_per_cluster) + target_offset
-                    //     );
-                    // }
-
                     break Some((extent_start_lcn * self.bytes_per_cluster) + target_offset);
                 } else {
                     extent_idx += 1;
@@ -126,27 +122,64 @@ impl MftStream {
         }
         .unwrap(); // TODO: proper error handling here
 
-        self.read_volume(volume_offset, buf)
+        self.read_volume(volume_offset, buf, use_cache)
     }
 
-    fn read_volume(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Error> {
+    fn read_volume(&mut self, offset: u64, buf: &mut [u8], use_cache: bool) -> Result<(), Error> {
         #[cfg(debug_assertions)]
         {
             println!("read_volume: {:X}", offset);
         }
 
-        let cur_buffer_end = self.buffer_offset + (self.buffer.len() as u64);
-        let request_end = offset + (buf.len() as u64);
+        if use_cache {
+            let cur_buffer_end = self.buffer_offset + (self.buffer.len() as u64);
+            let request_end = offset + (buf.len() as u64);
 
-        if cur_buffer_end < request_end || offset < self.buffer_offset {
-            // The read will go out of the buffer, so read a new one.
-            #[cfg(debug_assertions)]
-            {
-                println!("reading new buffer");
+            if cur_buffer_end < request_end || offset < self.buffer_offset {
+                // The read will go out of the buffer, so read a new one.
+                #[cfg(debug_assertions)]
+                {
+                    println!("reading new buffer");
+                }
+
+                self.buffer_offset = offset;
+
+                let mut overlapped = {
+                    let offset: u64 = offset.try_into().unwrap();
+                    let mut ov = OVERLAPPED::default();
+                    unsafe { ov.u.s_mut() }.Offset =
+                        (offset & 0x0000_0000_FFFF_FFFFu64).try_into().unwrap();
+                    unsafe { ov.u.s_mut() }.OffsetHigh = ((offset & 0xFFFF_FFFF_0000_0000u64)
+                        >> 32)
+                        .try_into()
+                        .unwrap();
+                    ov
+                };
+
+                let mut num_bytes_read = 0;
+                let success = unsafe {
+                    ReadFile(
+                        *self.volume_handle,
+                        self.buffer.as_mut_ptr() as *mut c_void,
+                        self.buffer.len().try_into().unwrap(),
+                        &mut num_bytes_read,
+                        &mut overlapped,
+                    )
+                };
+                if success == 0 {
+                    let err = unsafe { ehapi::GetLastError() };
+                    return Err(Error::ReadVolumeFailed(err));
+                }
+                let num_bytes_read: usize = num_bytes_read.try_into().unwrap();
+                if num_bytes_read != self.buffer.len() {
+                    return Err(Error::ReadVolumeTooShort);
+                }
             }
 
-            self.buffer_offset = offset;
-
+            let buffer_start: usize = (offset - self.buffer_offset).try_into().unwrap();
+            let buffer_end = buffer_start + buf.len();
+            buf.copy_from_slice(&self.buffer[buffer_start..buffer_end]);
+        } else {
             let mut overlapped = {
                 let offset: u64 = offset.try_into().unwrap();
                 let mut ov = OVERLAPPED::default();
@@ -162,8 +195,8 @@ impl MftStream {
             let success = unsafe {
                 ReadFile(
                     *self.volume_handle,
-                    self.buffer.as_mut_ptr() as *mut c_void,
-                    self.buffer.len().try_into().unwrap(),
+                    buf.as_mut_ptr() as *mut c_void,
+                    buf.len().try_into().unwrap(),
                     &mut num_bytes_read,
                     &mut overlapped,
                 )
@@ -173,14 +206,10 @@ impl MftStream {
                 return Err(Error::ReadVolumeFailed(err));
             }
             let num_bytes_read: usize = num_bytes_read.try_into().unwrap();
-            if num_bytes_read != self.buffer.len() {
+            if num_bytes_read != buf.len() {
                 return Err(Error::ReadVolumeTooShort);
             }
         }
-
-        let buffer_start: usize = (offset - self.buffer_offset).try_into().unwrap();
-        let buffer_end = buffer_start + buf.len();
-        buf.copy_from_slice(&self.buffer[buffer_start..buffer_end]);
 
         Ok(())
     }
