@@ -1,6 +1,7 @@
 use crate::{err::Error, SafeHandle};
 
 use winapi::{
+    ctypes::c_void,
     shared::{minwindef::DWORD, winerror},
     um::{
         errhandlingapi as ehapi,
@@ -12,7 +13,7 @@ use winapi::{
     },
 };
 
-use std::{convert::TryInto as _, ffi::c_void, mem, ptr};
+use std::{convert::TryInto as _, mem, ptr};
 
 // Represents a continuous list of logical clusters in one file.
 #[derive(Debug, Clone, Copy)]

@@ -1,19 +1,24 @@
 use crate::{err::Error, SafeHandle};
 
-use winapi::um::{
-    errhandlingapi as ehapi,
-    fileapi::{CreateFileW, OPEN_EXISTING},
-    handleapi::INVALID_HANDLE_VALUE,
-    ioapiset::DeviceIoControl,
-    winbase::FILE_FLAG_BACKUP_SEMANTICS,
-    winioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_EXTENDED_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER},
-    winnt::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE},
+use winapi::{
+    ctypes::c_void,
+    um::{
+        errhandlingapi as ehapi,
+        fileapi::{CreateFileW, OPEN_EXISTING},
+        handleapi::INVALID_HANDLE_VALUE,
+        ioapiset::DeviceIoControl,
+        winbase::FILE_FLAG_BACKUP_SEMANTICS,
+        winioctl::{
+            FSCTL_GET_NTFS_VOLUME_DATA, NTFS_EXTENDED_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER,
+        },
+        winnt::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE},
+    },
 };
 
 use std::{
     collections::HashSet,
     convert::TryInto as _,
-    ffi::{c_void, OsStr, OsString},
+    ffi::{OsStr, OsString},
     mem,
     os::windows::ffi::{OsStrExt as _, OsStringExt as _},
     path::Path,
@@ -35,8 +40,6 @@ pub struct MftEntry {
     pub standard_information: Vec<sys::StandardInformation>,
     pub filename: Vec<sys::FileName>,
     pub data: Vec<sys::Data>,
-    pub reparse_point: Vec<sys::ReparsePoint>,
-    // pub children: Vec<(u64, sys::FileName)>,
 }
 impl MftEntry {
     pub fn get_best_filename(&self) -> Option<OsString> {
@@ -108,12 +111,6 @@ impl MasterFileTable {
     ) -> Result<(), Error> {
         use sys::AttributeType;
 
-        // let is_i30 = if let Some(ref name) = attribute_name {
-        //     name.to_string_lossy() == sys::INDEX_30_ATTRIBUTE_NAME
-        // } else {
-        //     false
-        // };
-
         match attrib_header.type_code {
             AttributeType::StandardInformation => {
                 entry
@@ -149,43 +146,6 @@ impl MasterFileTable {
                 self.parse_attribute_list(attribute_data, current_file_record_segment, entry)?;
             }
 
-            AttributeType::ReparsePoint => {
-                entry
-                    .reparse_point
-                    .push(sys::ReparsePoint::load(attribute_data, attribute_name)?);
-            }
-
-            // AttributeType::IndexRoot if is_i30 => {
-            //     match sys::IndexRoot::load(attribute_data, attribute_name)? {
-            //         Some(sys::IndexRoot {
-            //             attribute_type: AttributeType::FileName,
-            //             entries,
-            //             bytes_per_record,
-            //             ..
-            //         }) => {
-            //             let bytes_per_record = bytes_per_record as u64;
-            //             if bytes_per_record < self.bytes_per_cluster {
-            //                 self.bytes_per_index_record = self.bytes_per_sector * bytes_per_record;
-            //             } else {
-            //                 self.bytes_per_index_record = bytes_per_record;
-            //             }
-
-            //             for child_entry in entries {
-            //                 entry.children.push((
-            //                     child_entry.file_reference,
-            //                     sys::FileName::load(child_entry.stream, None)?,
-            //                 ));
-            //             }
-            //         }
-            //         Some(_) => println!("Found $I30 IndexRoot over non-FileName attributes!"),
-            //         None => println!("Found $I30 IndexRoot over non-Attribute data!"),
-            //     }
-            // }
-            // AttributeType::Bitmap if is_i30 => {
-            //     println!("$I30 bitmap data: {:?}", attribute_data);
-            //     todo!()
-            //     // TODO
-            // }
             type_code @ AttributeType::IndexAllocation => {
                 return Err(Error::UnsupportedResident(type_code));
             }
@@ -198,7 +158,8 @@ impl MasterFileTable {
             | AttributeType::VolumeInformation
             | AttributeType::VolumeName
             | AttributeType::IndexRoot
-            | AttributeType::Bitmap => {}
+            | AttributeType::Bitmap
+            | AttributeType::ReparsePoint => {}
         };
 
         Ok(())
@@ -214,12 +175,6 @@ impl MasterFileTable {
         entry: &mut MftEntry,
     ) -> Result<(), Error> {
         use sys::AttributeType;
-
-        // let is_i30 = if let Some(ref name) = attribute_name {
-        //     name.to_string_lossy() == sys::INDEX_30_ATTRIBUTE_NAME
-        // } else {
-        //     false
-        // };
 
         match attrib_header.type_code {
             type_code @ AttributeType::StandardInformation
@@ -256,22 +211,6 @@ impl MasterFileTable {
                 )?;
             }
 
-            // AttributeType::IndexAllocation if is_i30 => {
-            //     let (total_size, data_runs) = self.read_data_run_list(data_runs);
-            //     println!("IndexAllocation: {} {:#?}", total_size, data_runs);
-
-            //     let mut index_data = self.read_non_resident_data(total_size, data_runs)?;
-            //     self.parse_index(&mut index_data[..], entry)?;
-            // }
-
-            // AttributeType::Bitmap if is_i30 => {
-            //     let (total_size, data_runs) = self.read_data_run_list(data_runs);
-            //     println!("Bitmap: {} {:#?}", total_size, data_runs);
-
-            //     let bitmap_data = self.read_non_resident_data(total_size, data_runs)?;
-            //     todo!()
-            //     // TODO
-            // }
             AttributeType::SecurityDescriptor
             | AttributeType::LoggedUtilityStream
             | AttributeType::Ea
@@ -281,28 +220,6 @@ impl MasterFileTable {
 
         Ok(())
     }
-
-    // fn parse_index(&mut self, buf: &mut [u8], entry: &mut MftEntry) -> Result<(), Error> {
-    //     let index_header = sys::IndexRecordHeader::load(buf)?;
-    //     self.fix_record_with_update_sequence(&index_header.multi_sector_header, buf)?;
-
-    //     let index_node_header = sys::IndexNodeHeader::load(&buf[24..40])?;
-
-    //     // The entry list offset is relative to the index node header, which begins
-    //     // 24 bytes into the record.
-    //     let start_offset = 24 + index_node_header.index_entry_list_offset;
-    //     let end_offset = start_offset + index_node_header.index_entries_total_size;
-    //     let entries = sys::IndexEntry::load_list(&buf[start_offset..end_offset])?;
-
-    //     for child_entry in entries {
-    //         entry.children.push((
-    //             child_entry.file_reference,
-    //             sys::FileName::load(child_entry.stream, None)?,
-    //         ));
-    //     }
-
-    //     Ok(())
-    // }
 
     fn parse_segment(
         &mut self,
@@ -608,7 +525,6 @@ impl Iterator for MasterFileTable {
                 // children: Default::default(),
                 data: Default::default(),
                 filename: Default::default(),
-                reparse_point: Default::default(),
                 standard_information: Default::default(),
             };
 

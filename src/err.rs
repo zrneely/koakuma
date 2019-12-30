@@ -13,8 +13,6 @@ pub enum Error {
     GetVolumePathNamesFailed(DWORD),
     OpenVolumeHandleFailed(DWORD),
     MissingNullTerminator,
-    TimeConversionFailure(DWORD),
-    InvalidTimeRepr,
     GetNtfsVolumeDataFailed(DWORD),
     UnknownNtfsVersion,
     GetNtfsVolumeDataBadSize,
@@ -32,22 +30,13 @@ pub enum Error {
     UnknownStandardInformationSize(usize),
     UnknownFilenameSize(usize),
     UnknownAttributeListEntrySize(usize),
-    GuidParseError(uuid::Error),
     BadMultiSectorHeaderSignature,
-    UnknownReparseDataSize(usize),
     UpdateSequenceValidationFailed,
-    // UnknownIndexEntrySize(usize),
-    // UnknownIndexNodeHeaderSize(usize),
     AttributeListPointedToUnusedFileRecord,
 }
 impl From<NulError> for Error {
     fn from(err: NulError) -> Self {
         Error::CStringNulError(err)
-    }
-}
-impl From<uuid::Error> for Error {
-    fn from(err: uuid::Error) -> Self {
-        Error::GuidParseError(err)
     }
 }
 impl std::error::Error for Error {}
