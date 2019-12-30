@@ -49,11 +49,11 @@ Reading C:\...
 ████████████████████████████████████████████████████████████████████████████████████████████████████████ 434176/434176
 Read 434176 MFT entries in 8 seconds (49496 entries/sec)
 Largest files on C: by allocated size:
-        52759 C:\Recovery\Customizations\ICB.ppkg: 2.09GiB
-        81976 C:\Windows\SoftwareDistribution\Download\75b55ce526640b7b2d7d7b3d1bb1d62e\Windows10.0-KB4524570-x64.cab: 312.75MiB
-        2902 C:\ProgramData\Microsoft\Search\Data\Applications\Windows\Windows.edb: 280.00MiB
-        261862 C:\Windows\System32\MRT.exe: 123.25MiB
-        147769 C:\Program Files\Mozilla Firefox\xul.dll: 102.27MiB
+        C:\Recovery\Customizations\ICB.ppkg: 2.09GiB
+        C:\Windows\SoftwareDistribution\Download\75b55ce526640b7b2d7d7b3d1bb1d62e\Windows10.0-KB4524570-x64.cab: 312.75MiB
+        C:\ProgramData\Microsoft\Search\Data\Applications\Windows\Windows.edb: 280.00MiB
+        C:\Windows\System32\MRT.exe: 123.25MiB
+        C:\Program Files\Mozilla Firefox\xul.dll: 102.27MiB
 
 Largest directories on C: by total allocated size of immediate children:
         C:\Recovery\Customizations: 4.18GiB

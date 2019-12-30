@@ -193,8 +193,7 @@ fn handle_volume(volume: volumes::VolumeInfo, options: &Options) -> Result<(), e
             }
 
             println!(
-                "\t{} {}: {}",
-                candidate_idx.index,
+                "\t{}: {}",
                 filesystem
                     .get_full_path(candidate_idx.index)
                     .expect("large file with no name :/"),
