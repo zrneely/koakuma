@@ -8,7 +8,7 @@
             "name": "(Windows) Launch",
             "type": "cppvsdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/target/debug/koumacount.exe",
+            "program": "${workspaceFolder}/target/debug/koakuma.exe",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
