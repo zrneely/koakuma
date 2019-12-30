@@ -58,7 +58,8 @@ struct Filesystem {
     drive_letter: String,
     entries: HashMap<u64, mft::MftEntry>,
     allocated_size_heap: BinaryHeap<SizeHeapEntry<u64>>,
-    extension_size_map: HashMap<Option<OsString>, (u64, Vec<u64>)>,
+    extension_size_map: HashMap<Option<OsString>, u64>,
+    directory_size_map: HashMap<u64, u64>,
     bytes_per_cluster: u64,
 }
 impl Filesystem {
@@ -74,6 +75,7 @@ impl Filesystem {
             entries: HashMap::with_capacity(entry_count),
             allocated_size_heap: BinaryHeap::with_capacity(entry_count),
             extension_size_map: HashMap::new(),
+            directory_size_map: HashMap::new(),
             bytes_per_cluster,
         }
     }
@@ -105,11 +107,19 @@ impl Filesystem {
 
                 self.extension_size_map
                     .entry(extension)
-                    .and_modify(|&mut (ref mut counter, ref mut indecies)| {
+                    .and_modify(|counter| {
                         *counter += size;
-                        indecies.push(entry.base_record_segment_idx);
                     })
-                    .or_insert((size, vec![entry.base_record_segment_idx]));
+                    .or_insert(size);
+
+                for parent in entry.parents() {
+                    self.directory_size_map
+                        .entry(parent)
+                        .and_modify(|counter| {
+                            *counter += size;
+                        })
+                        .or_insert(size);
+                }
             }
         }
 
@@ -199,11 +209,40 @@ fn handle_volume(volume: volumes::VolumeInfo, options: &Options) -> Result<(), e
 
     println!();
     println!(
+        "Largest directories on {} by total allocated size of immediate children:",
+        filesystem.drive_letter
+    );
+    let mut directory_heap = BinaryHeap::new();
+    for (dir, size) in filesystem.directory_size_map.iter() {
+        directory_heap.push(SizeHeapEntry {
+            index: *dir,
+            size: *size,
+        });
+    }
+
+    let mut count = 0;
+    while count < options.max_count {
+        if let Some(candidate_idx) = directory_heap.pop() {
+            println!(
+                "\t{}: {}",
+                filesystem
+                    .get_full_path(candidate_idx.index)
+                    .expect("large directory with no name :/"),
+                BinaryBytes(candidate_idx.size)
+            );
+            count += 1;
+        } else {
+            break;
+        }
+    }
+
+    println!();
+    println!(
         "Largest extensions on {} by total allocated size:",
         filesystem.drive_letter
     );
     let mut extension_heap = BinaryHeap::new();
-    for (ext, (size, _)) in filesystem.extension_size_map.iter() {
+    for (ext, size) in filesystem.extension_size_map.iter() {
         extension_heap.push(SizeHeapEntry {
             index: ext.clone(),
             size: *size,
