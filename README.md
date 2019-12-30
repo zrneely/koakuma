@@ -6,6 +6,7 @@ Because it reads the NTFS Master File Table, Koakuma must be run elevated (with 
 
 ## Features
 
+* Reads the MFT, so scans are very fast - comparable to WizTree and much faster than WinDirStat or SpaceSniffer.
 * Koakuma is aware of sparse files and OneDrive's Files on Demand, and will not count them towards disk usage (unlike WizTree).
 * No animated "donate" button (unlike WizTree).
 * Koakuma is aware of alternate data streams, and will count all data streams towards a file's total size. It can also count only non-default data streams to help you identify files with large ADSs.
@@ -17,7 +18,6 @@ Because it reads the NTFS Master File Table, Koakuma must be run elevated (with 
 ```
 > koakuma.exe -h
 koakuma 0.1.0
-Zachary Neely <zrussellneely@gmail.com>
 Finds big files and folders
 
 USAGE:

@@ -18,7 +18,6 @@ use std::{
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const APP_AUTHOR: &str = env!("CARGO_PKG_AUTHORS");
 const APP_DESCRIPTION: &str = env!("CARGO_PKG_DESCRIPTION");
 
 #[derive(Debug)]
@@ -283,7 +282,6 @@ impl Options {
     fn load() -> Self {
         let matches = App::new(APP_NAME)
         .version(APP_VERSION)
-        .author(APP_AUTHOR)
         .about(APP_DESCRIPTION)
         .arg(
             Arg::with_name("include_system")
