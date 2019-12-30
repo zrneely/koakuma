@@ -1,7 +1,4 @@
-use crate::{
-    err::Error,
-    mft::{parse_segment_number, parse_string},
-};
+use crate::{err::Error, mft::parse_string};
 
 use chrono::{DateTime, TimeZone as _, Utc};
 use uuid::Uuid;
@@ -12,22 +9,27 @@ use winapi::{
 
 use std::{convert::TryInto as _, ffi::OsString};
 
-const MULTI_SECTOR_HEADER_SIGNATURE: [u8; 4] = [b'F', b'I', b'L', b'E'];
+const MULTI_SECTOR_HEADER_FILE_SIGNATURE: [u8; 4] = [b'F', b'I', b'L', b'E'];
+const MULTI_SECTOR_HEADER_INDEX_SIGNATURE: [u8; 4] = [b'I', b'N', b'D', b'X'];
+
+#[derive(Debug)]
 pub struct MultiSectorHeader {
-    pub signature: [u8; 4],
     pub update_sequence_array_offset: u16,
     pub update_sequence_array_size: u16,
 }
-pub const MULTI_SECTOR_HEADER_LEN: usize = 8;
 impl MultiSectorHeader {
-    pub fn load(buf: &[u8]) -> Result<Self, Error> {
-        if buf[0..4] != MULTI_SECTOR_HEADER_SIGNATURE {
-            println!("Bad signature: {:?}", &buf[0..4]);
+    pub fn load(buf: &[u8], is_file: bool) -> Result<Self, Error> {
+        let expected = if is_file {
+            MULTI_SECTOR_HEADER_FILE_SIGNATURE
+        } else {
+            MULTI_SECTOR_HEADER_INDEX_SIGNATURE
+        };
+
+        if buf[0..4] != expected {
             return Err(Error::BadMultiSectorHeaderSignature);
         }
 
         let header = MultiSectorHeader {
-            signature: [buf[0], buf[1], buf[2], buf[3]],
             update_sequence_array_offset: u16::from_le_bytes([buf[4], buf[5]]),
             update_sequence_array_size: u16::from_le_bytes([buf[6], buf[7]]),
         };
@@ -35,6 +37,7 @@ impl MultiSectorHeader {
     }
 }
 
+#[derive(Debug, Copy, Clone)]
 pub struct FileReference {
     pub segment_number_low: u32,
     pub segment_number_high: u16,
@@ -49,80 +52,58 @@ impl FileReference {
         }
     }
 }
+impl From<FileReference> for u64 {
+    fn from(reference: FileReference) -> u64 {
+        ((reference.segment_number_high as u64) << 32) | (reference.segment_number_low as u64)
+    }
+}
 
-pub mod segment_header_flags {
+// // The only thing we need from this is the update sequence array stuff.
+// #[derive(Debug)]
+// pub struct IndexRecordHeader {
+//     pub multi_sector_header: MultiSectorHeader,
+// }
+// impl IndexRecordHeader {
+//     pub fn load(buf: &[u8]) -> Result<Self, Error> {
+//         let multi_sector_header = MultiSectorHeader::load(buf, false /*is_file*/)?;
+
+//         Ok(IndexRecordHeader {
+//             multi_sector_header,
+//         })
+//     }
+// }
+
+mod segment_header_flags {
     pub const FILE_RECORD_SEGMENT_IN_USE: u16 = 0x0001;
     // pub const FILE_NAME_INDEX_PRESENT: u16 = 0x0002;
 }
 
 pub struct FileRecordSegmentHeader {
     pub multi_sector_header: MultiSectorHeader,
-    pub log_file_sequence_number: u64,
-    pub sequence_number: u16, // epoch-like counter used to track uses of the file
     pub hard_link_count: u16,
     pub first_attribute_offset: u16, // offset of the first attribute record
-    pub flags: u16,
-    pub used_size_of_file_record: u32,
-    pub allocated_size_of_file_record: u32,
     pub base_file_record_segment: FileReference,
-    pub next_attrib_id: u16,
-    // reserved: u16,
-    pub mft_record_num: u32,
 }
 impl FileRecordSegmentHeader {
-    pub fn load(mut buf: &[u8]) -> Result<Self, Error> {
-        let multi_sector_header = MultiSectorHeader::load(buf)?;
-        buf = &buf[MULTI_SECTOR_HEADER_LEN..];
+    // Returns Ok(None) if not in use
+    pub fn load(buf: &[u8]) -> Result<Option<Self>, Error> {
+        let multi_sector_header = MultiSectorHeader::load(&buf[..8], true /*is_file*/)?;
 
-        let log_file_sequence_number = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        buf = &buf[8..];
-
-        let sequence_number = u16::from_le_bytes([buf[0], buf[1]]);
-        buf = &buf[2..];
-
-        let hard_link_count = u16::from_le_bytes([buf[0], buf[1]]);
-        buf = &buf[2..];
-
-        let first_attribute_offset = u16::from_le_bytes([buf[0], buf[1]]);
-        buf = &buf[2..];
-
-        let flags = u16::from_le_bytes([buf[0], buf[1]]);
-        buf = &buf[2..];
-
-        let used_size_of_file_record = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        buf = &buf[4..];
-
-        let allocated_size_of_file_record = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        buf = &buf[4..];
-
-        let base_file_record_segment = FileReference::load(buf);
-        buf = &buf[8..];
-
-        let next_attrib_id = u16::from_le_bytes([buf[0], buf[1]]);
-        buf = &buf[4..]; // skip 4 bytes, but only 2 are meaningful
-
-        let mft_record_num = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        // buf = &buf[4..];
-
-        let header = FileRecordSegmentHeader {
-            multi_sector_header,
-            log_file_sequence_number,
-            sequence_number,
-            hard_link_count,
-            first_attribute_offset,
-            flags,
-            used_size_of_file_record,
-            allocated_size_of_file_record,
-            base_file_record_segment,
-            next_attrib_id,
-            mft_record_num,
-        };
-
-        Ok(header)
+        let flags = u16::from_le_bytes(buf[22..24].try_into().unwrap());
+        if is_flag_set16(flags, segment_header_flags::FILE_RECORD_SEGMENT_IN_USE) {
+            Ok(Some(FileRecordSegmentHeader {
+                multi_sector_header,
+                hard_link_count: u16::from_le_bytes(buf[18..20].try_into().unwrap()),
+                first_attribute_offset: u16::from_le_bytes(buf[20..22].try_into().unwrap()),
+                base_file_record_segment: FileReference::load(&buf[32..40]),
+            }))
+        } else {
+            Ok(None)
+        }
     }
 }
 
-pub mod attribute_types {
+mod attribute_types {
     // read-only, timestamps, hard link count, etc
     pub const STANDARD_INFORMATION: u32 = 0x10;
     // list of attributes that make up the file
@@ -154,13 +135,62 @@ pub mod attribute_types {
     pub const LOGGED_UTILITY_STREAM: u32 = 0x100;
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AttributeType {
+    StandardInformation,
+    AttributeList,
+    FileName,
+    ObjectId,
+    SecurityDescriptor,
+    VolumeName,
+    VolumeInformation,
+    Data,
+    IndexRoot,
+    IndexAllocation,
+    Bitmap,
+    ReparsePoint,
+    EaInformation,
+    Ea,
+    LoggedUtilityStream,
+}
+impl std::convert::TryFrom<u32> for AttributeType {
+    type Error = Error;
+
+    fn try_from(val: u32) -> Result<Self, Error> {
+        use attribute_types::*;
+        use AttributeType::*;
+
+        Ok(match val {
+            STANDARD_INFORMATION => StandardInformation,
+            ATTRIBUTE_LIST => AttributeList,
+            FILE_NAME => FileName,
+            OBJECT_ID => ObjectId,
+            SECURITY_DESCRIPTOR => SecurityDescriptor,
+            VOLUME_NAME => VolumeName,
+            VOLUME_INFORMATION => VolumeInformation,
+            DATA => Data,
+            INDEX_ROOT => IndexRoot,
+            INDEX_ALLOCATION => IndexAllocation,
+            BITMAP => Bitmap,
+            REPARSE_POINT => ReparsePoint,
+            EA_INFORMATION => EaInformation,
+            EA => Ea,
+            LOGGED_UTILITY_STREAM => LoggedUtilityStream,
+
+            _ => return Err(Error::UnknownAttributeTypeCode(val)),
+        })
+    }
+}
+
 pub mod form_codes {
     pub const RESIDENT: u8 = 0;
     pub const NON_RESIDENT: u8 = 1;
 }
 
+pub const ATTRIBUTE_RECORD_HEADER_LENGTH: usize = 16;
+#[derive(Debug)]
 pub struct AttributeRecordHeader {
-    pub type_code: u32, // unspecified width, but due to padding it's effectively 32 bits
+    pub type_code: AttributeType, // unspecified width, but due to padding it's effectively 32 bits
     pub record_length: u32,
     pub form_code: u8,
     pub name_length: u8, // attribute name, not file name
@@ -169,21 +199,20 @@ pub struct AttributeRecordHeader {
     pub instance: u16,
 }
 impl AttributeRecordHeader {
-    pub fn load(buf: &[u8]) -> (Self, usize) {
-        let header = AttributeRecordHeader {
-            type_code: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+    pub fn load(buf: &[u8]) -> Result<Self, Error> {
+        Ok(AttributeRecordHeader {
+            type_code: u32::from_le_bytes(buf[0..4].try_into().unwrap()).try_into()?,
             record_length: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
             form_code: buf[8],
             name_length: buf[9],
             name_offset: u16::from_le_bytes([buf[10], buf[11]]),
             flags: u16::from_le_bytes([buf[12], buf[13]]),
             instance: u16::from_le_bytes([buf[14], buf[15]]),
-        };
-
-        (header, 16)
+        })
     }
 }
 
+#[derive(Debug)]
 pub struct AttributeRecordHeaderResident {
     pub value_length: u32,
     pub value_offset: u16,
@@ -244,19 +273,6 @@ mod standard_info_flags {
     pub const ENCRYPTED: u32 = 0x4000;
     pub const DIRECTORY: u32 = 0x1000_0000;
     pub const INDEX_VIEW: u32 = 0x2000_0000;
-}
-
-mod filename_types {
-    // up to 255 WTF-16 "code points"; case sensitive; only NUL and / aren't allowed.
-    pub const POSIX: u8 = 0;
-    // up to 255 WTF-16 "code points"; case insensitive; these characters aren't allowed:
-    // "*+,/:;<=>?\
-    // and it can't end with a period or a space.
-    pub const WIN32: u8 = 1;
-    // 8.3 name; only upper case english letters allowed.
-    pub const DOS: u8 = 2;
-    // when the win32 name fits in 8.3
-    pub const WIN32_DOS: u8 = 3;
 }
 
 #[derive(Debug)]
@@ -329,12 +345,25 @@ impl StandardInformation {
 
 pub const FILE_NAME_LENGTH: usize = 66; // sizeof(FileName)
 
-#[derive(Debug, PartialEq)]
+mod filename_types {
+    // up to 255 WTF-16 "code points"; case sensitive; only NUL and / aren't allowed.
+    pub const POSIX: u8 = 0;
+    // up to 255 WTF-16 "code points"; case insensitive; these characters aren't allowed:
+    // "*+,/:;<=>?\
+    // and it can't end with a period or a space.
+    pub const WIN32: u8 = 1;
+    // 8.3 name; only upper case english letters allowed.
+    pub const DOS: u8 = 2;
+    // when the win32 name fits in 8.3
+    pub const WIN32_DOS: u8 = 3;
+}
+
+#[derive(Debug, Clone, PartialEq, PartialOrd, Ord, Eq)]
 pub enum FileNameType {
     Posix,
     Win32,
-    Dos,
     Win32AndDos,
+    Dos,
 }
 
 // One of the names of the file.
@@ -378,7 +407,7 @@ impl FileName {
                 filename_types::WIN32_DOS => FileNameType::Win32AndDos,
                 unknown => return Err(Error::UnknownFilenameType(unknown)),
             },
-            parent: parse_segment_number(&FileReference::load(&buf[0..8])),
+            parent: FileReference::load(&buf[0..8]).into(),
             created: parse_time(u64::from_le_bytes(buf[8..16].try_into().unwrap()))?,
             modified: parse_time(u64::from_le_bytes(buf[16..24].try_into().unwrap()))?,
             mft_record_modified: parse_time(u64::from_le_bytes(buf[24..32].try_into().unwrap()))?,
@@ -406,7 +435,7 @@ pub struct Data {
     pub runs: Option<Vec<DataRun>>,
 }
 impl Data {
-    pub fn compute_allocated_size_bytes(&self, bytes_per_cluster: u64) -> u64 {
+    pub fn compute_allocated_size(&self, bytes_per_cluster: u64) -> u64 {
         let mut total_size = 0;
         if let Some(ref runs) = self.runs {
             for run in runs {
@@ -464,6 +493,148 @@ impl ReparsePoint {
         })
     }
 }
+
+// mod index_node_header_flags {
+//     pub const HAS_SUBNODES: u8 = 1;
+// }
+
+// #[derive(Debug)]
+// pub struct IndexNodeHeader {
+//     pub index_entry_list_offset: usize,
+//     pub index_entries_total_size: usize,
+//     pub index_entries_allocated_size: usize,
+//     pub has_subnodes: bool,
+// }
+// impl IndexNodeHeader {
+//     pub fn load(buf: &[u8]) -> Result<Self, Error> {
+//         if buf.len() < 16 {
+//             return Err(Error::UnknownIndexNodeHeaderSize(buf.len()));
+//         }
+
+//         Ok(IndexNodeHeader {
+//             index_entry_list_offset: u32::from_le_bytes(buf[0..4].try_into().unwrap())
+//                 .try_into()
+//                 .unwrap(),
+//             index_entries_total_size: u32::from_le_bytes(buf[4..8].try_into().unwrap())
+//                 .try_into()
+//                 .unwrap(),
+//             index_entries_allocated_size: u32::from_le_bytes(buf[8..12].try_into().unwrap())
+//                 .try_into()
+//                 .unwrap(),
+//             has_subnodes: is_flag_set8(buf[12], index_node_header_flags::HAS_SUBNODES),
+//         })
+//     }
+// }
+
+// mod index_entry_flags {
+//     pub const POINTS_TO_SUBNODE: u8 = 1;
+//     pub const LAST: u8 = 2;
+// }
+
+// #[derive(Debug)]
+// pub struct IndexEntry<'a> {
+//     pub file_reference: u64,
+//     pub stream: &'a [u8],
+//     pub subnode_vcn: Option<u64>,
+// }
+// impl<'a> IndexEntry<'a> {
+//     pub fn load(buf: &'a [u8]) -> Result<(Option<Self>, usize), Error> {
+//         if buf.len() <= 10 {
+//             return Err(Error::UnknownIndexEntrySize(buf.len()));
+//         }
+
+//         let entry_len: usize = u16::from_le_bytes(buf[8..10].try_into().unwrap())
+//             .try_into()
+//             .unwrap();
+
+//         if buf.len() < entry_len {
+//             return Err(Error::UnknownIndexEntrySize(buf.len()));
+//         }
+
+//         let stream_len: usize = u16::from_le_bytes(buf[10..12].try_into().unwrap())
+//             .try_into()
+//             .unwrap();
+
+//         let points_to_subnode = is_flag_set8(buf[12], index_entry_flags::POINTS_TO_SUBNODE);
+
+//         if is_flag_set8(buf[12], index_entry_flags::LAST) {
+//             Ok((None, entry_len))
+//         } else {
+//             Ok((
+//                 Some(IndexEntry {
+//                     file_reference: FileReference::load(&buf[..8]).into(),
+//                     stream: &buf[16..16 + stream_len],
+//                     subnode_vcn: if points_to_subnode {
+//                         Some(u64::from_le_bytes(
+//                             buf[entry_len - 8..entry_len].try_into().unwrap(),
+//                         ))
+//                     } else {
+//                         None
+//                     },
+//                 }),
+//                 entry_len,
+//             ))
+//         }
+//     }
+
+//     pub fn load_list(mut buf: &'a [u8]) -> Result<Vec<Self>, Error> {
+//         let mut result = Vec::new();
+//         while !buf.is_empty() {
+//             let (entry, consumed) = IndexEntry::load(buf)?;
+//             buf = &buf[consumed..];
+
+//             if let Some(entry) = entry {
+//                 result.push(entry);
+//             } else {
+//                 // This is the last entry, with no stream/data.
+//                 break;
+//             }
+//         }
+//         Ok(result)
+//     }
+// }
+
+// pub const DEFAULT_BYTES_PER_INDEX_RECORD: u64 = 4096;
+// pub const INDEX_30_ATTRIBUTE_NAME: &str = "$I30";
+
+// #[derive(Debug)]
+// pub struct IndexRoot<'a> {
+//     pub name: Option<OsString>,
+//     // This is None if the index doesn't store attributes.
+//     pub attribute_type: AttributeType,
+//     pub bytes_per_record: u32,
+//     pub clusters_per_record: u8,
+//     pub has_subnodes: bool,
+//     pub entries: Vec<IndexEntry<'a>>,
+// }
+// impl<'a> IndexRoot<'a> {
+//     // Doesn't load if the index isn't over attributes (for example, things like the indexes on $Secure
+//     // will produce Ok(None) here).
+//     pub fn load(buf: &'a [u8], name: Option<OsString>) -> Result<Option<Self>, Error> {
+//         let attribute_type = u32::from_le_bytes(buf[0..4].try_into().unwrap()).try_into();
+//         match attribute_type {
+//             Ok(attribute_type) => {
+//                 let index_node_header = IndexNodeHeader::load(&buf[16..32])?;
+
+//                 // offset is relative to the start of the index node header, which starts 16 bytes
+//                 // into the attribute itself
+//                 let start_pos = 16 + index_node_header.index_entry_list_offset;
+//                 let end_pos = start_pos + index_node_header.index_entries_total_size;
+//                 let entries = IndexEntry::load_list(&buf[start_pos..end_pos.min(buf.len())])?;
+
+//                 Ok(Some(IndexRoot {
+//                     name,
+//                     attribute_type,
+//                     bytes_per_record: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+//                     clusters_per_record: buf[12],
+//                     has_subnodes: index_node_header.has_subnodes,
+//                     entries,
+//                 }))
+//             }
+//             Err(_) => Ok(None),
+//         }
+//     }
+// }
 
 pub struct AttributeListEntry {
     pub type_code: u32,
@@ -524,3 +695,11 @@ fn parse_time(time: u64) -> Result<DateTime<Utc>, Error> {
 fn is_flag_set(data: u32, flag: u32) -> bool {
     (data & flag) != 0
 }
+
+fn is_flag_set16(data: u16, flag: u16) -> bool {
+    (data & flag) != 0
+}
+
+// fn is_flag_set8(data: u8, flag: u8) -> bool {
+//     (data & flag) != 0
+// }

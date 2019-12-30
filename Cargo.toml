@@ -4,8 +4,14 @@ version = "0.1.0"
 authors = ["Zachary Neely <zrussellneely@gmail.com>"]
 edition = "2018"
 
+[profile.release]
+lto = true
+
 [dependencies.chrono]
 version = "0.4"
+
+[dependencies.indicatif]
+version = "0.13"
 
 [dependencies.uuid]
 version = "0.8"

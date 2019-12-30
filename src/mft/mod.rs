@@ -14,44 +14,44 @@ use std::{
     collections::HashSet,
     convert::TryInto as _,
     ffi::{c_void, OsStr, OsString},
-    fmt, mem,
+    mem,
     os::windows::ffi::{OsStrExt as _, OsStringExt as _},
     path::Path,
     ptr,
 };
 
 mod stream;
-mod sys;
+pub mod sys;
 
 use stream::MftStream;
 
 const NTFS_VOLUME_DATA_BUFFER_SIZE: usize =
     (mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() + mem::size_of::<NTFS_EXTENDED_VOLUME_DATA>());
 
-#[derive(Debug, Default)]
-pub struct Attributes {
+#[derive(Debug)]
+pub struct MftEntry {
+    pub base_record_segment_idx: u64,
+    pub hard_link_count: u16,
     pub standard_information: Vec<sys::StandardInformation>,
     pub filename: Vec<sys::FileName>,
     pub data: Vec<sys::Data>,
     pub reparse_point: Vec<sys::ReparsePoint>,
+    // pub children: Vec<(u64, sys::FileName)>,
 }
+impl MftEntry {
+    pub fn get_best_filename(&self) -> Option<OsString> {
+        self.filename.first().map(|e| e.filename.clone())
+    }
 
-#[derive(Debug)]
-pub struct MftEntry {
-    pub attributes: Attributes,
-    pub base_record_segment_idx: u64,
-}
-impl fmt::Display for MftEntry {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        if let Some(filename) = self.attributes.filename.first() {
-            fmt.debug_struct("File Record")
-                .field("first filename", &filename.filename)
-                .field("logical size", &filename.logical_size)
-                .field("physical size", &filename.physical_size)
-                .finish()
-        } else {
-            fmt.debug_struct("File Record").finish()
-        }
+    pub fn parents(&self) -> Vec<u64> {
+        self.filename.iter().map(|f| f.parent).collect()
+    }
+
+    pub fn get_allocated_size(&self, bytes_per_cluster: u64) -> u64 {
+        self.data
+            .iter()
+            .map(|data| data.compute_allocated_size(bytes_per_cluster))
+            .sum()
     }
 }
 
@@ -61,9 +61,11 @@ pub struct MasterFileTable {
     bytes_per_sector: u64,
     bytes_per_cluster: u64,
     current_file_record_segment: u64,
+    // This can vary from index to index
+    // bytes_per_index_record: u64,
 }
 impl MasterFileTable {
-    pub fn load(volume_handle: SafeHandle, volume_path: &OsStr) -> Result<Self, Error> {
+    pub fn load(volume_handle: SafeHandle, volume_path: &OsStr) -> Result<(Self, u64), Error> {
         let (volume_data, extended_data) = get_ntfs_volume_data(&volume_handle)?;
 
         // We only know how to deal with NTFS 3.0 or 3.1 data. Make sure the volume
@@ -76,17 +78,17 @@ impl MasterFileTable {
 
         let mft_handle = get_mft_handle(volume_path)?;
 
-        Ok(MasterFileTable {
-            mft_stream: MftStream::new(volume_handle, volume_data, &mft_handle)?,
-            bytes_per_file_record_segment: volume_data.BytesPerFileRecordSegment.into(),
-            bytes_per_sector: volume_data.BytesPerSector.into(),
-            bytes_per_cluster: volume_data.BytesPerCluster.into(),
-            current_file_record_segment: 0,
-        })
-    }
-
-    pub fn len(&self) -> u64 {
-        self.mft_stream.len()
+        Ok((
+            MasterFileTable {
+                mft_stream: MftStream::new(volume_handle, volume_data, &mft_handle)?,
+                bytes_per_file_record_segment: volume_data.BytesPerFileRecordSegment.into(),
+                bytes_per_sector: volume_data.BytesPerSector.into(),
+                bytes_per_cluster: volume_data.BytesPerCluster.into(),
+                current_file_record_segment: 0,
+                // bytes_per_index_record: sys::DEFAULT_BYTES_PER_INDEX_RECORD,
+            },
+            volume_data.BytesPerCluster.into(),
+        ))
     }
 
     pub fn entry_count(&self) -> u64 {
@@ -96,17 +98,25 @@ impl MasterFileTable {
     // private helpers
 
     fn parse_resident_attribute(
-        &self,
+        &mut self,
         attrib_header: &sys::AttributeRecordHeader,
         resident_header: &sys::AttributeRecordHeaderResident,
         attribute_name: Option<OsString>,
         attribute_data: &[u8],
         current_file_record_segment: u64,
-        results: &mut Attributes,
+        entry: &mut MftEntry,
     ) -> Result<(), Error> {
+        use sys::AttributeType;
+
+        // let is_i30 = if let Some(ref name) = attribute_name {
+        //     name.to_string_lossy() == sys::INDEX_30_ATTRIBUTE_NAME
+        // } else {
+        //     false
+        // };
+
         match attrib_header.type_code {
-            sys::attribute_types::STANDARD_INFORMATION => {
-                results
+            AttributeType::StandardInformation => {
+                entry
                     .standard_information
                     .push(sys::StandardInformation::load(
                         attribute_data,
@@ -114,16 +124,16 @@ impl MasterFileTable {
                     )?);
             }
 
-            sys::attribute_types::FILE_NAME => {
-                results
+            AttributeType::FileName => {
+                entry
                     .filename
                     .push(sys::FileName::load(attribute_data, attribute_name)?);
             }
 
             // For resident DATA streams, we report physical size equal to the
             // logical size.
-            sys::attribute_types::DATA => {
-                results.data.push(sys::Data {
+            AttributeType::Data => {
+                entry.data.push(sys::Data {
                     name: attribute_name,
                     logical_size: resident_header.value_length.into(),
                     physical_size: resident_header.value_length.into(),
@@ -131,58 +141,99 @@ impl MasterFileTable {
                 });
             }
 
-            sys::attribute_types::ATTRIBUTE_LIST => {
+            AttributeType::AttributeList => {
                 #[cfg(debug_assertions)]
                 {
                     println!("Reading resident attribute list");
                 }
-                self.parse_attribute_list(attribute_data, current_file_record_segment, results)?;
+                self.parse_attribute_list(attribute_data, current_file_record_segment, entry)?;
             }
 
-            sys::attribute_types::REPARSE_POINT => {
-                results
+            AttributeType::ReparsePoint => {
+                entry
                     .reparse_point
                     .push(sys::ReparsePoint::load(attribute_data, attribute_name)?);
             }
 
-            sys::attribute_types::SECURITY_DESCRIPTOR
-            | sys::attribute_types::INDEX_ROOT
-            | sys::attribute_types::INDEX_ALLOCATION
-            | sys::attribute_types::LOGGED_UTILITY_STREAM
-            | sys::attribute_types::EA
-            | sys::attribute_types::EA_INFORMATION
-            | sys::attribute_types::OBJECT_ID
-            | sys::attribute_types::BITMAP
-            | sys::attribute_types::VOLUME_INFORMATION
-            | sys::attribute_types::VOLUME_NAME => {}
+            // AttributeType::IndexRoot if is_i30 => {
+            //     match sys::IndexRoot::load(attribute_data, attribute_name)? {
+            //         Some(sys::IndexRoot {
+            //             attribute_type: AttributeType::FileName,
+            //             entries,
+            //             bytes_per_record,
+            //             ..
+            //         }) => {
+            //             let bytes_per_record = bytes_per_record as u64;
+            //             if bytes_per_record < self.bytes_per_cluster {
+            //                 self.bytes_per_index_record = self.bytes_per_sector * bytes_per_record;
+            //             } else {
+            //                 self.bytes_per_index_record = bytes_per_record;
+            //             }
 
-            unknown => {
-                return Err(Error::UnknownAttributeTypeCode(unknown));
+            //             for child_entry in entries {
+            //                 entry.children.push((
+            //                     child_entry.file_reference,
+            //                     sys::FileName::load(child_entry.stream, None)?,
+            //                 ));
+            //             }
+            //         }
+            //         Some(_) => println!("Found $I30 IndexRoot over non-FileName attributes!"),
+            //         None => println!("Found $I30 IndexRoot over non-Attribute data!"),
+            //     }
+            // }
+            // AttributeType::Bitmap if is_i30 => {
+            //     println!("$I30 bitmap data: {:?}", attribute_data);
+            //     todo!()
+            //     // TODO
+            // }
+            type_code @ AttributeType::IndexAllocation => {
+                return Err(Error::UnsupportedResident(type_code));
             }
+
+            AttributeType::SecurityDescriptor
+            | AttributeType::LoggedUtilityStream
+            | AttributeType::Ea
+            | AttributeType::EaInformation
+            | AttributeType::ObjectId
+            | AttributeType::VolumeInformation
+            | AttributeType::VolumeName
+            | AttributeType::IndexRoot
+            | AttributeType::Bitmap => {}
         };
 
         Ok(())
     }
 
     fn parse_non_resident_attribute(
-        &self,
+        &mut self,
         attrib_header: &sys::AttributeRecordHeader,
         non_resident_header: &sys::AttributeRecordHeaderNonResident,
         attribute_name: Option<OsString>,
         current_file_record_segment: u64,
         data_runs: &[u8],
-        results: &mut Attributes,
+        entry: &mut MftEntry,
     ) -> Result<(), Error> {
+        use sys::AttributeType;
+
+        // let is_i30 = if let Some(ref name) = attribute_name {
+        //     name.to_string_lossy() == sys::INDEX_30_ATTRIBUTE_NAME
+        // } else {
+        //     false
+        // };
+
         match attrib_header.type_code {
-            type_code @ sys::attribute_types::STANDARD_INFORMATION
-            | type_code @ sys::attribute_types::OBJECT_ID
-            | type_code @ sys::attribute_types::VOLUME_NAME
-            | type_code @ sys::attribute_types::VOLUME_INFORMATION
-            | type_code @ sys::attribute_types::EA_INFORMATION => {
+            type_code @ AttributeType::StandardInformation
+            | type_code @ AttributeType::ObjectId
+            | type_code @ AttributeType::VolumeName
+            | type_code @ AttributeType::VolumeInformation
+            | type_code @ AttributeType::EaInformation
+            | type_code @ AttributeType::FileName
+            | type_code @ AttributeType::ReparsePoint
+            | type_code @ AttributeType::IndexRoot => {
                 return Err(Error::UnsupportedNonResident(type_code))
             }
 
-            sys::attribute_types::DATA => results.data.push(sys::Data {
+            AttributeType::Data => entry.data.push(sys::Data {
                 name: attribute_name,
                 logical_size: non_resident_header.file_size,
                 physical_size: non_resident_header.allocated_length,
@@ -192,48 +243,75 @@ impl MasterFileTable {
                 },
             }),
 
-            sys::attribute_types::ATTRIBUTE_LIST => {
+            AttributeType::AttributeList => {
                 // We actually need to go read this
-                let data = self.read_non_resident_data(data_runs)?;
+                let (total_size, data_runs) = self.read_data_run_list(data_runs);
+                let data = self.read_non_resident_data(total_size, data_runs)?;
                 debug_assert_eq!(data.len(), non_resident_header.allocated_length as usize);
 
                 self.parse_attribute_list(
                     &data[..non_resident_header.valid_data_length as usize],
                     current_file_record_segment,
-                    results,
+                    entry,
                 )?;
             }
 
-            sys::attribute_types::SECURITY_DESCRIPTOR
-            | sys::attribute_types::INDEX_ROOT
-            | sys::attribute_types::INDEX_ALLOCATION
-            | sys::attribute_types::LOGGED_UTILITY_STREAM
-            | sys::attribute_types::EA
-            | sys::attribute_types::BITMAP => {}
+            // AttributeType::IndexAllocation if is_i30 => {
+            //     let (total_size, data_runs) = self.read_data_run_list(data_runs);
+            //     println!("IndexAllocation: {} {:#?}", total_size, data_runs);
 
-            unknown => {
-                return Err(Error::UnknownAttributeTypeCode(unknown));
-            }
+            //     let mut index_data = self.read_non_resident_data(total_size, data_runs)?;
+            //     self.parse_index(&mut index_data[..], entry)?;
+            // }
+
+            // AttributeType::Bitmap if is_i30 => {
+            //     let (total_size, data_runs) = self.read_data_run_list(data_runs);
+            //     println!("Bitmap: {} {:#?}", total_size, data_runs);
+
+            //     let bitmap_data = self.read_non_resident_data(total_size, data_runs)?;
+            //     todo!()
+            //     // TODO
+            // }
+            AttributeType::SecurityDescriptor
+            | AttributeType::LoggedUtilityStream
+            | AttributeType::Ea
+            | AttributeType::Bitmap
+            | AttributeType::IndexAllocation => {}
         };
 
         Ok(())
     }
 
+    // fn parse_index(&mut self, buf: &mut [u8], entry: &mut MftEntry) -> Result<(), Error> {
+    //     let index_header = sys::IndexRecordHeader::load(buf)?;
+    //     self.fix_record_with_update_sequence(&index_header.multi_sector_header, buf)?;
+
+    //     let index_node_header = sys::IndexNodeHeader::load(&buf[24..40])?;
+
+    //     // The entry list offset is relative to the index node header, which begins
+    //     // 24 bytes into the record.
+    //     let start_offset = 24 + index_node_header.index_entry_list_offset;
+    //     let end_offset = start_offset + index_node_header.index_entries_total_size;
+    //     let entries = sys::IndexEntry::load_list(&buf[start_offset..end_offset])?;
+
+    //     for child_entry in entries {
+    //         entry.children.push((
+    //             child_entry.file_reference,
+    //             sys::FileName::load(child_entry.stream, None)?,
+    //         ));
+    //     }
+
+    //     Ok(())
+    // }
+
     fn parse_segment(
-        &self,
+        &mut self,
         segment_header: &sys::FileRecordSegmentHeader,
         current_file_record_segment: u64,
         allow_extensions: bool,
         buf: &[u8],
-        results: &mut Attributes,
+        entry: &mut MftEntry,
     ) -> Result<bool, Error> {
-        if (segment_header.flags & sys::segment_header_flags::FILE_RECORD_SEGMENT_IN_USE) == 0 {
-            #[cfg(debug_assertions)]
-            {
-                println!("Skipping non-used record: {}", current_file_record_segment);
-            }
-            return Ok(false);
-        }
         if !allow_extensions
             && ((segment_header.base_file_record_segment.segment_number_low != 0)
                 || (segment_header.base_file_record_segment.segment_number_high != 0))
@@ -245,9 +323,11 @@ impl MasterFileTable {
             }
             return Ok(false);
         }
+
         let mut attribute_buffer = &buf[segment_header.first_attribute_offset as usize..];
         loop {
-            let (attrib_header, consumed) = sys::AttributeRecordHeader::load(attribute_buffer);
+            let attrib_header = sys::AttributeRecordHeader::load(attribute_buffer)?;
+
             // Attribute names are WTF-16 but the maximum length is 255 *bytes*.
             let attribute_name = match attrib_header.name_length {
                 0 => None,
@@ -258,10 +338,12 @@ impl MasterFileTable {
                     Some(parse_string(name_buffer))
                 }
             };
+
             match attrib_header.form_code {
                 sys::form_codes::RESIDENT => {
-                    let (resident_header, _) =
-                        sys::AttributeRecordHeaderResident::load(&attribute_buffer[consumed..]);
+                    let (resident_header, _) = sys::AttributeRecordHeaderResident::load(
+                        &attribute_buffer[sys::ATTRIBUTE_RECORD_HEADER_LENGTH..],
+                    );
                     // The data is resident, so we don't need additional reads to get it.
                     // value_offset measures from the beginning of the attribute record.
                     let start_offset: usize = resident_header.value_offset.try_into().unwrap();
@@ -274,13 +356,14 @@ impl MasterFileTable {
                         attribute_name,
                         attribute_data,
                         current_file_record_segment,
-                        results,
+                        entry,
                     )?;
                 }
 
                 sys::form_codes::NON_RESIDENT => {
-                    let (nonresident_header, _) =
-                        sys::AttributeRecordHeaderNonResident::load(&attribute_buffer[consumed..]);
+                    let (nonresident_header, _) = sys::AttributeRecordHeaderNonResident::load(
+                        &attribute_buffer[sys::ATTRIBUTE_RECORD_HEADER_LENGTH..],
+                    );
 
                     let start_offset: usize =
                         nonresident_header.mapping_pairs_offset.try_into().unwrap();
@@ -292,7 +375,7 @@ impl MasterFileTable {
                         attribute_name,
                         current_file_record_segment,
                         data_runs,
-                        results,
+                        entry,
                     )?;
                 }
 
@@ -311,10 +394,10 @@ impl MasterFileTable {
     }
 
     fn parse_attribute_list(
-        &self,
+        &mut self,
         mut buf: &[u8],
         current_file_record_segment: u64,
-        results: &mut Attributes,
+        entry: &mut MftEntry,
     ) -> Result<(), Error> {
         let mut segment_buf = vec![0; self.bytes_per_file_record_segment as usize];
         let mut record_segments = HashSet::new();
@@ -333,7 +416,7 @@ impl MasterFileTable {
 
             buf = &buf[record_len..];
 
-            let segment_to_read = parse_segment_number(&attrib.segment_reference);
+            let segment_to_read = attrib.segment_reference.into();
             if segment_to_read != current_file_record_segment {
                 record_segments.insert(segment_to_read);
             }
@@ -343,15 +426,19 @@ impl MasterFileTable {
             // Read the segment
             self.mft_stream
                 .read_file_record_segment(segment_to_read, &mut segment_buf[..])?;
-            let segment_header = sys::FileRecordSegmentHeader::load(&segment_buf[..])?;
-            self.fix_record_with_update_sequence(&segment_header, &mut segment_buf[..])?;
+            let segment_header = sys::FileRecordSegmentHeader::load(&segment_buf[..])?
+                .ok_or(Error::AttributeListPointedToUnusedFileRecord)?;
+            self.fix_record_with_update_sequence(
+                &segment_header.multi_sector_header,
+                &mut segment_buf[..],
+            )?;
 
             self.parse_segment(
                 &segment_header,
                 segment_to_read,
                 true,
                 &segment_buf[..],
-                results,
+                entry,
             )?;
         }
 
@@ -361,22 +448,14 @@ impl MasterFileTable {
     // The data must start on a sector boundary (will be the case for all file record segments).
     fn fix_record_with_update_sequence(
         &self,
-        segment_header: &sys::FileRecordSegmentHeader,
+        header: &sys::MultiSectorHeader,
         data: &mut [u8],
     ) -> Result<(), Error> {
         // First, find the update sequence array
-        let start_offset: usize = segment_header
-            .multi_sector_header
-            .update_sequence_array_offset
-            .try_into()
-            .unwrap();
+        let start_offset: usize = header.update_sequence_array_offset.try_into().unwrap();
 
         let end_offset = {
-            let size: usize = segment_header
-                .multi_sector_header
-                .update_sequence_array_size
-                .try_into()
-                .unwrap();
+            let size: usize = header.update_sequence_array_size.try_into().unwrap();
             start_offset + (size * 2)
         };
 
@@ -438,12 +517,15 @@ impl MasterFileTable {
         (total_size, runs)
     }
 
-    fn read_non_resident_data(&self, data_runs: &[u8]) -> Result<Vec<u8>, Error> {
-        let (total_size, runs) = self.read_data_run_list(data_runs);
+    fn read_non_resident_data(
+        &mut self,
+        total_size: u64,
+        data_runs: Vec<sys::DataRun>,
+    ) -> Result<Vec<u8>, Error> {
         let mut buffer = vec![0; total_size.try_into().unwrap()];
         let mut cur_buf_offset: usize = 0;
 
-        for run in runs {
+        for run in data_runs {
             let end_offset: usize =
                 cur_buf_offset + (run.cluster_count * self.bytes_per_cluster) as usize;
             self.mft_stream.read_clusters(
@@ -466,6 +548,8 @@ impl Iterator for MasterFileTable {
 
         // We loop until we read a record that's in use and is not an extension of a previous one.
         loop {
+            // self.bytes_per_index_record = sys::DEFAULT_BYTES_PER_INDEX_RECORD;
+
             if self.current_file_record_segment >= self.mft_stream.get_file_record_segment_count() {
                 break None;
             }
@@ -487,42 +571,65 @@ impl Iterator for MasterFileTable {
                         self.current_file_record_segment
                     );
                 }
+
                 self.current_file_record_segment += 1;
                 continue;
             }
 
             let segment_header = match sys::FileRecordSegmentHeader::load(&segment_buffer[..]) {
-                Ok(header) => header,
-                Err(err) => break Some(Err(err)),
-            };
+                Ok(Some(header)) => header,
+                Ok(None) => {
+                    #[cfg(debug_assertions)]
+                    {
+                        println!(
+                            "Skipping non-used record: {}",
+                            self.current_file_record_segment
+                        );
+                    }
 
-            // Use the update sequence array to validate and correct the buffer.
-            match self.fix_record_with_update_sequence(&segment_header, &mut segment_buffer[..]) {
-                Ok(_) => {}
-                Err(err) => break Some(Err(err)),
-            }
-
-            let mut attributes = Attributes::default();
-            let entry = match self.parse_segment(
-                &segment_header,
-                self.current_file_record_segment,
-                false, // allow extensions
-                &segment_buffer[..],
-                &mut attributes,
-            ) {
-                Ok(true) => MftEntry {
-                    attributes,
-                    base_record_segment_idx: self.current_file_record_segment,
-                },
-                Ok(false) => {
                     self.current_file_record_segment += 1;
                     continue;
                 }
                 Err(err) => break Some(Err(err)),
             };
 
-            self.current_file_record_segment += 1;
-            break Some(Ok(entry));
+            // Use the update sequence array to validate and correct the buffer.
+            match self.fix_record_with_update_sequence(
+                &segment_header.multi_sector_header,
+                &mut segment_buffer[..],
+            ) {
+                Ok(_) => {}
+                Err(err) => break Some(Err(err)),
+            }
+
+            let mut entry = MftEntry {
+                base_record_segment_idx: self.current_file_record_segment,
+                hard_link_count: segment_header.hard_link_count,
+                // children: Default::default(),
+                data: Default::default(),
+                filename: Default::default(),
+                reparse_point: Default::default(),
+                standard_information: Default::default(),
+            };
+
+            match self.parse_segment(
+                &segment_header,
+                self.current_file_record_segment,
+                false, // allow extensions
+                &segment_buffer[..],
+                &mut entry,
+            ) {
+                Ok(true) => {
+                    self.current_file_record_segment += 1;
+                    entry.filename.sort_by_key(|f| f.filename_type.clone());
+                    break Some(Ok(entry));
+                }
+                Ok(false) => {
+                    self.current_file_record_segment += 1;
+                    continue;
+                }
+                Err(err) => break Some(Err(err)),
+            };
         }
     }
 }
@@ -605,13 +712,22 @@ fn get_mft_handle(volume_path: &OsStr) -> Result<SafeHandle, Error> {
 }
 
 fn parse_runlist_unsigned_int(data: &[u8], width: u8) -> u64 {
-    let mut out = [0u8; 8];
-    let ptr_out = out.as_mut_ptr();
+    #[repr(align(8))]
+    struct Align8([u8; 8]);
+
+    if width == 0 {
+        return 0;
+    }
+
+    let mut out = Align8([0u8; 8]);
+    let ptr_out = out.0.as_mut_ptr();
     unsafe {
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr_out, width as usize);
 
         #[allow(clippy::cast_ptr_alignment)]
-        std::ptr::read_unaligned(ptr_out as *const u64)
+        {
+            *(ptr_out as *const u64)
+        }
     }
 }
 
@@ -622,11 +738,11 @@ fn parse_runlist_signed_int(data: &[u8], width: u8) -> i64 {
         (val << shift) as i64 >> shift
     }
 
-    extend_sign(parse_runlist_unsigned_int(data, width), width.into())
-}
+    if width == 0 {
+        return 0;
+    }
 
-fn parse_segment_number(num: &sys::FileReference) -> u64 {
-    ((num.segment_number_high as u64) << 32) | (num.segment_number_low as u64)
+    extend_sign(parse_runlist_unsigned_int(data, width), width.into())
 }
 
 fn parse_string(utf16data: &[u8]) -> OsString {

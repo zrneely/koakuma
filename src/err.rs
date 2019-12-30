@@ -27,7 +27,8 @@ pub enum Error {
     UnknownFormCode(u8),
     UnknownAttributeTypeCode(u32),
     UnknownFilenameType(u8),
-    UnsupportedNonResident(u32),
+    UnsupportedNonResident(crate::mft::sys::AttributeType),
+    UnsupportedResident(crate::mft::sys::AttributeType),
     UnknownStandardInformationSize(usize),
     UnknownFilenameSize(usize),
     UnknownAttributeListEntrySize(usize),
@@ -35,6 +36,9 @@ pub enum Error {
     BadMultiSectorHeaderSignature,
     UnknownReparseDataSize(usize),
     UpdateSequenceValidationFailed,
+    // UnknownIndexEntrySize(usize),
+    // UnknownIndexNodeHeaderSize(usize),
+    AttributeListPointedToUnusedFileRecord,
 }
 impl From<NulError> for Error {
     fn from(err: NulError) -> Self {

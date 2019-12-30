@@ -32,6 +32,9 @@ pub struct MftStream {
     bytes_per_file_record_segment: u64,
     len: u64,
     extents: Vec<Extent>,
+
+    buffer: Vec<u8>,
+    buffer_offset: u64, // into the volume
 }
 impl MftStream {
     pub fn new(
@@ -59,29 +62,25 @@ impl MftStream {
                 .try_into()
                 .unwrap(),
             extents,
+            // Keep a 4 MB buffer. Experimentation, at least on my device,
+            // has shown this to be a good balance between reducing ReadFile
+            // calls when reading sequential records and not taking to long
+            // on extra ReadFile calls when reading non-resident data.
+            buffer: vec![0; 4 * 1024 * 1024],
+            buffer_offset: 0,
         })
-    }
-
-    pub fn len(&self) -> u64 {
-        self.len
     }
 
     pub fn get_file_record_segment_count(&self) -> u64 {
         self.len / self.bytes_per_file_record_segment
     }
 
-    pub fn read_clusters(&self, lcn: u64, count: u64, buf: &mut [u8]) -> Result<(), Error> {
+    pub fn read_clusters(&mut self, lcn: u64, count: u64, buf: &mut [u8]) -> Result<(), Error> {
         debug_assert_eq!(buf.len() as u64, count * self.bytes_per_cluster);
-
-        #[cfg(debug_assertions)]
-        {
-            println!("reading from {:X}", lcn * self.bytes_per_cluster);
-        }
-
         self.read_volume(lcn * self.bytes_per_cluster, buf)
     }
 
-    pub fn read_file_record_segment(&self, segment: u64, buf: &mut [u8]) -> Result<(), Error> {
+    pub fn read_file_record_segment(&mut self, segment: u64, buf: &mut [u8]) -> Result<(), Error> {
         debug_assert_eq!(0, self.len % self.bytes_per_file_record_segment);
         debug_assert_eq!(buf.len() as u64, self.bytes_per_file_record_segment);
 
@@ -129,36 +128,58 @@ impl MftStream {
         self.read_volume(volume_offset, buf)
     }
 
-    fn read_volume(&self, offset: u64, buf: &mut [u8]) -> Result<(), Error> {
-        let mut overlapped = {
-            let offset: u64 = offset.try_into().unwrap();
-            let mut ov = OVERLAPPED::default();
-            unsafe { ov.u.s_mut() }.Offset =
-                (offset & 0x0000_0000_FFFF_FFFFu64).try_into().unwrap();
-            unsafe { ov.u.s_mut() }.OffsetHigh = ((offset & 0xFFFF_FFFF_0000_0000u64) >> 32)
-                .try_into()
-                .unwrap();
-            ov
-        };
+    fn read_volume(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Error> {
+        #[cfg(debug_assertions)]
+        {
+            println!("read_volume: {:X}", offset);
+        }
 
-        let mut num_bytes_read = 0;
-        let success = unsafe {
-            ReadFile(
-                *self.volume_handle,
-                buf.as_mut_ptr() as *mut c_void,
-                buf.len().try_into().unwrap(),
-                &mut num_bytes_read,
-                &mut overlapped,
-            )
-        };
-        if success == 0 {
-            let err = unsafe { ehapi::GetLastError() };
-            return Err(Error::ReadVolumeFailed(err));
+        let cur_buffer_end = self.buffer_offset + (self.buffer.len() as u64);
+        let request_end = offset + (buf.len() as u64);
+
+        if cur_buffer_end < request_end || offset < self.buffer_offset {
+            // The read will go out of the buffer, so read a new one.
+            #[cfg(debug_assertions)]
+            {
+                println!("reading new buffer");
+            }
+
+            self.buffer_offset = offset;
+
+            let mut overlapped = {
+                let offset: u64 = offset.try_into().unwrap();
+                let mut ov = OVERLAPPED::default();
+                unsafe { ov.u.s_mut() }.Offset =
+                    (offset & 0x0000_0000_FFFF_FFFFu64).try_into().unwrap();
+                unsafe { ov.u.s_mut() }.OffsetHigh = ((offset & 0xFFFF_FFFF_0000_0000u64) >> 32)
+                    .try_into()
+                    .unwrap();
+                ov
+            };
+
+            let mut num_bytes_read = 0;
+            let success = unsafe {
+                ReadFile(
+                    *self.volume_handle,
+                    self.buffer.as_mut_ptr() as *mut c_void,
+                    self.buffer.len().try_into().unwrap(),
+                    &mut num_bytes_read,
+                    &mut overlapped,
+                )
+            };
+            if success == 0 {
+                let err = unsafe { ehapi::GetLastError() };
+                return Err(Error::ReadVolumeFailed(err));
+            }
+            let num_bytes_read: usize = num_bytes_read.try_into().unwrap();
+            if num_bytes_read != self.buffer.len() {
+                return Err(Error::ReadVolumeTooShort);
+            }
         }
-        let num_bytes_read: usize = num_bytes_read.try_into().unwrap();
-        if num_bytes_read != buf.len() {
-            return Err(Error::ReadVolumeTooShort);
-        }
+
+        let buffer_start: usize = (offset - self.buffer_offset).try_into().unwrap();
+        let buffer_end = buffer_start + buf.len();
+        buf.copy_from_slice(&self.buffer[buffer_start..buffer_end]);
 
         Ok(())
     }
