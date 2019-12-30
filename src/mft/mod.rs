@@ -136,6 +136,7 @@ impl MasterFileTable {
                     logical_size: resident_header.value_length.into(),
                     physical_size: resident_header.value_length.into(),
                     runs: None,
+                    is_sparse: false, // resident DATA can't be sparse
                 });
             }
 
@@ -197,6 +198,7 @@ impl MasterFileTable {
                     let (_, runs) = self.read_data_run_list(data_runs);
                     Some(runs)
                 },
+                is_sparse: attrib_header.is_sparse,
             }),
 
             AttributeType::AttributeList => {

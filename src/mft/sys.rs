@@ -157,6 +157,12 @@ pub mod form_codes {
     pub const NON_RESIDENT: u8 = 1;
 }
 
+mod attribute_record_header_flags {
+    pub const COMPRESSED: u16 = 0x0001;
+    pub const ENCRYPTED: u16 = 0x4000;
+    pub const SPARSE: u16 = 0x8000;
+}
+
 pub const ATTRIBUTE_RECORD_HEADER_LENGTH: usize = 16;
 #[derive(Debug)]
 pub struct AttributeRecordHeader {
@@ -165,18 +171,24 @@ pub struct AttributeRecordHeader {
     pub form_code: u8,
     pub name_length: u8, // attribute name, not file name
     pub name_offset: u16,
-    pub flags: u16,
+    pub is_compressed: bool,
+    pub is_encrypted: bool,
+    pub is_sparse: bool,
     pub instance: u16,
 }
 impl AttributeRecordHeader {
     pub fn load(buf: &[u8]) -> Result<Self, Error> {
+        let flags = u16::from_le_bytes([buf[12], buf[13]]);
+
         Ok(AttributeRecordHeader {
             type_code: u32::from_le_bytes(buf[0..4].try_into().unwrap()).try_into()?,
             record_length: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
             form_code: buf[8],
             name_length: buf[9],
             name_offset: u16::from_le_bytes([buf[10], buf[11]]),
-            flags: u16::from_le_bytes([buf[12], buf[13]]),
+            is_compressed: is_flag_set16(flags, attribute_record_header_flags::COMPRESSED),
+            is_encrypted: is_flag_set16(flags, attribute_record_header_flags::ENCRYPTED),
+            is_sparse: is_flag_set16(flags, attribute_record_header_flags::SPARSE),
             instance: u16::from_le_bytes([buf[14], buf[15]]),
         })
     }
@@ -381,12 +393,19 @@ pub struct Data {
     pub logical_size: u64,
     pub physical_size: u64,
     pub runs: Option<Vec<DataRun>>,
+    pub is_sparse: bool,
 }
 impl Data {
     pub fn compute_allocated_size(&self, bytes_per_cluster: u64) -> u64 {
         let mut total_size = 0;
         if let Some(ref runs) = self.runs {
             for run in runs {
+                // Sparse files (including placeholders) have extents starting at 0
+                // (discovered through experimentation - is that documented anywhere?)
+                if self.is_sparse && run.starting_lcn == 0 {
+                    continue;
+                }
+
                 total_size += run.cluster_count;
             }
         }
