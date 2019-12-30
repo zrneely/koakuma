@@ -1,9 +1,9 @@
 [package]
-name = "koumakan"
+name = "koumacount"
 version = "0.1.0"
 authors = ["Zachary Neely <zrussellneely@gmail.com>"]
 edition = "2018"
-description = "Finds files using lots of space"
+description = "Finds big files and folders"
 
 [profile.release]
 lto = true
