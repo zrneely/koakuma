@@ -175,7 +175,7 @@ fn handle_volume(volume: volumes::VolumeInfo, options: &Options) -> Result<(), e
         filesystem.drive_letter
     );
     let mut count = 0;
-    while count < 5 {
+    while count < options.max_count {
         if let Some(candidate_idx) = filesystem.allocated_size_heap.pop() {
             if candidate_idx.index < 24 {
                 // The first 24 files are special and shouldn't be reported to the user.
@@ -184,7 +184,8 @@ fn handle_volume(volume: volumes::VolumeInfo, options: &Options) -> Result<(), e
             }
 
             println!(
-                "\t{}: {}",
+                "\t{} {}: {}",
+                candidate_idx.index,
                 filesystem
                     .get_full_path(candidate_idx.index)
                     .expect("large file with no name :/"),
@@ -210,7 +211,7 @@ fn handle_volume(volume: volumes::VolumeInfo, options: &Options) -> Result<(), e
     }
 
     let mut count = 0;
-    while count < 5 {
+    while count < options.max_count {
         if let Some(candidate_idx) = extension_heap.pop() {
             if let Some(extension) = candidate_idx.index {
                 println!(
@@ -236,6 +237,7 @@ struct Options {
     skip_hidden: bool,
     only_alt: bool,
     skip_priv_check: bool,
+    max_count: usize,
     extension_list: Option<(bool, HashSet<OsString>)>, // true for whitelist
 }
 impl Options {
@@ -284,6 +286,13 @@ impl Options {
                 .takes_value(true)
                 .conflicts_with("extension_whitelist"),
         )
+        .arg(
+            Arg::with_name("max_count")
+                .short("n")
+                .long("max_count")
+                .help("The maximum number of results to display")
+                .takes_value(true),
+        )
         .get_matches();
 
         Options {
@@ -291,6 +300,10 @@ impl Options {
             skip_hidden: matches.is_present("skip_hidden"),
             only_alt: matches.is_present("only_alt_data"),
             skip_priv_check: matches.is_present("skip_priv_check"),
+            max_count: matches
+                .value_of("max_count")
+                .map(|c| c.parse().unwrap())
+                .unwrap_or(5),
             extension_list: {
                 if let Some(whitelist) = matches.value_of_os("extension_whitelist") {
                     let whitelist = whitelist
