@@ -50,9 +50,10 @@ impl MftEntry {
         self.filename.iter().map(|f| f.parent).collect()
     }
 
-    pub fn get_allocated_size(&self, bytes_per_cluster: u64) -> u64 {
+    pub fn get_allocated_size(&self, bytes_per_cluster: u64, only_alt: bool) -> u64 {
         self.data
             .iter()
+            .filter(|data| !(only_alt && data.name.is_none()))
             .map(|data| data.compute_allocated_size(bytes_per_cluster))
             .sum()
     }
