@@ -276,6 +276,7 @@ struct Options {
     skip_priv_check: bool,
     max_count: usize,
     extension_list: Option<(bool, HashSet<OsString>)>, // true for whitelist
+    drive_letters: Option<HashSet<char>>,
 }
 impl Options {
     fn load() -> Self {
@@ -329,6 +330,13 @@ impl Options {
                 .help("The maximum number of results to display")
                 .takes_value(true),
         )
+        .arg(
+            Arg::with_name("drive")
+                .short("f")
+                .long("drive")
+                .help("A comma-separated list of drive letters to include in the analysis. All drives will be included if not specified.")
+                .takes_value(true)
+        )
         .get_matches();
 
         Options {
@@ -359,6 +367,19 @@ impl Options {
                     None
                 }
             },
+            drive_letters: {
+                if let Some(values) = matches.value_of_os("drive") {
+                    Some(
+                        values
+                            .to_string_lossy()
+                            .split(',')
+                            .filter_map(|s| s.chars().next())
+                            .collect(),
+                    )
+                } else {
+                    None
+                }
+            },
         }
     }
 }
@@ -369,7 +390,7 @@ fn main() {
     match privileges::has_sufficient_privileges() {
         Ok(true) => {}
         Ok(false) => {
-            println!("{} must be run elevated!", APP_NAME);
+            eprintln!("{} must be run elevated!", APP_NAME);
             if options.skip_priv_check {
                 println!("Continuing anyway, although things will almost certainly fail.");
             } else {
@@ -377,15 +398,40 @@ fn main() {
             }
         }
         Err(err) => {
-            println!("Failed to check privilege level: {:?}", err);
+            eprintln!("Failed to check privilege level: {:?}", err);
             println!("Continuing anyway, although things will probably fail.");
         }
     }
 
     for volume in volumes::VolumeIterator::new().unwrap() {
-        let volume = volume.unwrap();
-        if !volume.paths.is_empty() {
-            handle_volume(volume, &options).unwrap();
+        match volume {
+            Ok(volume) => {
+                if !volume.paths.is_empty() {
+                    if let Some(ref whitelist) = options.drive_letters {
+                        let checker = |path: &OsString| {
+                            if let Some(first_char) = path.to_string_lossy().chars().next() {
+                                whitelist.contains(&first_char)
+                            } else {
+                                false
+                            }
+                        };
+
+                        if !volume.paths.iter().any(checker) {
+                            continue;
+                        }
+                    }
+
+                    match handle_volume(volume, &options) {
+                        Ok(_) => {}
+                        Err(err) => {
+                            eprintln!("Failed to process volume: {:?}", err);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("VolumeIterator produced an error: {:?}", err);
+            }
         }
     }
 }
