@@ -126,7 +126,7 @@ impl Filesystem {
     }
 
     fn get_full_path(&self, entry: u64) -> Option<String> {
-        let mut entry = self.entries.get(&entry).unwrap();
+        let mut entry = self.entries.get(&entry)?;
         let mut result = self.drive_letter.clone();
 
         let mut parts = Vec::new();
@@ -136,7 +136,7 @@ impl Filesystem {
 
             if parents[0] != entry.base_record_segment_idx {
                 parts.push(entry.get_best_filename()?);
-                entry = self.entries.get(&parents[0]).unwrap();
+                entry = self.entries.get(&parents[0])?;
             } else {
                 break;
             }
@@ -346,7 +346,7 @@ impl Options {
             skip_priv_check: matches.is_present("skip_priv_check"),
             max_count: matches
                 .value_of("max_count")
-                .map(|c| c.parse().unwrap())
+                .and_then(|c| c.parse().ok())
                 .unwrap_or(5),
             extension_list: {
                 if let Some(whitelist) = matches.value_of_os("extension_whitelist") {
