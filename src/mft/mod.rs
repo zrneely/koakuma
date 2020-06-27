@@ -31,7 +31,7 @@ pub mod sys;
 use stream::MftStream;
 
 const NTFS_VOLUME_DATA_BUFFER_SIZE: usize =
-    (mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() + mem::size_of::<NTFS_EXTENDED_VOLUME_DATA>());
+    mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() + mem::size_of::<NTFS_EXTENDED_VOLUME_DATA>();
 
 #[derive(Debug)]
 pub struct MftEntry {
