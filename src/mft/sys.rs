@@ -2,6 +2,8 @@ use crate::{err::Error, mft::parse_string};
 
 use std::{convert::TryInto as _, ffi::OsString};
 
+use super::AttributeName;
+
 const MULTI_SECTOR_HEADER_FILE_SIGNATURE: [u8; 4] = [b'F', b'I', b'L', b'E'];
 
 #[derive(Debug)]
@@ -295,11 +297,11 @@ impl From<u32> for StandardFlags {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct StandardInformation {
-    pub name: Option<OsString>,
+    pub name: AttributeName,
     pub flags: StandardFlags,
 }
 impl StandardInformation {
-    pub fn load(buf: &[u8], name: Option<OsString>) -> Result<Self, Error> {
+    pub fn load(buf: &[u8], name: AttributeName) -> Result<Self, Error> {
         if buf.len() != 72 && buf.len() != 48 {
             return Err(Error::UnknownStandardInformationSize(buf.len()));
         }
@@ -340,8 +342,7 @@ pub enum FileNameType {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct FileName {
-    // name OF THE ATTRIBUTE, not the file name
-    pub name: Option<OsString>,
+    pub name: AttributeName,
     pub filename: OsString,
     pub filename_type: FileNameType,
     pub parent: u64,
@@ -351,7 +352,7 @@ pub struct FileName {
     pub reparse_tag: u32,
 }
 impl FileName {
-    pub fn load(buf: &[u8], name: Option<OsString>) -> Result<Self, Error> {
+    pub fn load(buf: &[u8], name: AttributeName) -> Result<Self, Error> {
         if buf.len() < (FILE_NAME_LENGTH + 2) {
             return Err(Error::UnknownFilenameSize(buf.len()));
         }
@@ -389,7 +390,7 @@ pub struct DataRun {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct Data {
-    pub name: Option<OsString>,
+    pub name: AttributeName,
     pub logical_size: u64,
     pub physical_size: u64,
     pub runs: Option<Vec<DataRun>>,

@@ -34,6 +34,27 @@ const NTFS_VOLUME_DATA_BUFFER_SIZE: usize =
     mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() + mem::size_of::<NTFS_EXTENDED_VOLUME_DATA>();
 
 #[derive(Debug)]
+pub enum AttributeName {
+    None,
+    I30,
+    ZoneIdentifier,
+    TxfData,
+    Custom(OsString),
+}
+// The string "$I30" in UTF-16
+const I30_BYTES: &'static [u8] = &[0x24, 0x00, 0x49, 0x00, 0x33, 0x00, 0x30, 0x00];
+// The string "Zone.Identifier" in UTF-16
+const ZONE_ID_BYTES: &'static [u8] = &[
+    0x5A, 0x00, 0x6F, 0x00, 0x6E, 0x00, 0x65, 0x00, 0x2E, 0x00, 0x49, 0x00, 0x64, 0x00, 0x65, 0x00,
+    0x6E, 0x00, 0x74, 0x00, 0x69, 0x00, 0x66, 0x00, 0x69, 0x00, 0x65, 0x00, 0x72, 0x00,
+];
+// The string "$TXF_DATA" in UTF-16
+const TXF_DATA_BYTES: &'static [u8] = &[
+    0x24, 0x00, 0x54, 0x00, 0x58, 0x00, 0x46, 0x00, 0x5f, 0x00, 0x44, 0x00, 0x41, 0x00, 0x54, 0x00,
+    0x41, 0x00,
+];
+
+#[derive(Debug)]
 pub struct MftEntry {
     pub base_record_segment_idx: u64,
     pub hard_link_count: u16,
@@ -53,7 +74,7 @@ impl MftEntry {
     pub fn get_allocated_size(&self, bytes_per_cluster: u64, only_alt: bool) -> u64 {
         self.data
             .iter()
-            .filter(|data| !(only_alt && data.name.is_none()))
+            .filter(|data| !(only_alt && matches!(data.name, AttributeName::None)))
             .map(|data| data.compute_allocated_size(bytes_per_cluster))
             .sum()
     }
@@ -102,7 +123,7 @@ impl MasterFileTable {
         &mut self,
         attrib_header: &sys::AttributeRecordHeader,
         resident_header: &sys::AttributeRecordHeaderResident,
-        attribute_name: Option<OsString>,
+        attribute_name: AttributeName,
         attribute_data: &[u8],
         current_file_record_segment: u64,
         entry: &mut MftEntry,
@@ -168,7 +189,7 @@ impl MasterFileTable {
         &mut self,
         attrib_header: &sys::AttributeRecordHeader,
         non_resident_header: &sys::AttributeRecordHeaderNonResident,
-        attribute_name: Option<OsString>,
+        attribute_name: AttributeName,
         current_file_record_segment: u64,
         data_runs: &[u8],
         entry: &mut MftEntry,
@@ -247,12 +268,21 @@ impl MasterFileTable {
 
             // Attribute names are WTF-16 but the maximum length is 255 *bytes*.
             let attribute_name = match attrib_header.name_length {
-                0 => None,
+                0 => AttributeName::None,
                 pseudo_code_points => {
                     let name_start: usize = attrib_header.name_offset.try_into().unwrap();
                     let name_end: usize = name_start + (2 * pseudo_code_points) as usize;
                     let name_buffer = &attribute_buffer[name_start..name_end];
-                    Some(parse_string(name_buffer))
+
+                    if name_buffer == I30_BYTES {
+                        AttributeName::I30
+                    } else if name_buffer == ZONE_ID_BYTES {
+                        AttributeName::ZoneIdentifier
+                    } else if name_buffer == TXF_DATA_BYTES {
+                        AttributeName::TxfData
+                    } else {
+                        AttributeName::Custom(parse_string(name_buffer))
+                    }
                 }
             };
 
@@ -525,10 +555,9 @@ impl Iterator for MasterFileTable {
             let mut entry = MftEntry {
                 base_record_segment_idx: self.current_file_record_segment,
                 hard_link_count: segment_header.hard_link_count,
-                // children: Default::default(),
-                data: Default::default(),
-                filename: Default::default(),
-                standard_information: Default::default(),
+                data: Vec::with_capacity(1),
+                filename: Vec::with_capacity(3),
+                standard_information: Vec::with_capacity(1),
             };
 
             match self.parse_segment(
