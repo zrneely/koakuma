@@ -2,30 +2,37 @@
 name = "koakuma"
 version = "0.1.0"
 authors = ["Zachary Neely <zrussellneely@gmail.com>"]
-edition = "2018"
+edition = "2021"
 description = "Finds big files and folders"
+
+[features]
+cli = ["clap", "indicatif"]
+gui = ["egui", "eframe", "winres"]
+default = ["cli"]
 
 [profile.release]
 lto = true
 # debug = true
 
-[dependencies.clap]
-version = "2"
+[build-dependencies]
+winres = { version="0.1", optional=true }
 
-[dependencies.indicatif]
-version = "0.15"
+[dependencies]
+egui = { version = "0.18", optional=true }
+eframe = { version = "0.18", optional=true }
 
-[dependencies.winapi]
-version = "0.3"
+clap = { version = "3", optional=true }
+indicatif = { version = "0.16", optional=true }
+
+[dependencies.windows]
+version = "0.37"
 features = [
-    "errhandlingapi",
-    "handleapi",
-    "ioapiset",
-    "impl-default",
-    "processthreadsapi",
-    "securitybaseapi",
-    "winbase",
-    "winerror",
-    "winioctl",
-    "winnt",
+    "alloc",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
 ]

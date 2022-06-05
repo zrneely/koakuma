@@ -1,24 +1,24 @@
-use winapi::shared::minwindef::DWORD;
+use windows::core::HRESULT;
 
 use std::{ffi::NulError, fmt};
 
 #[derive(Debug)]
 pub enum Error {
-    CStringNulError(NulError),
-    LookupPrivilegeValueFailed(DWORD),
-    GetSelfProcessTokenFailed(DWORD),
-    AdjustTokenPrivilegesFailed(DWORD),
-    FindFirstVolumeFailed(DWORD),
-    FindNextVolumeFailed(DWORD),
-    GetVolumePathNamesFailed(DWORD),
-    OpenVolumeHandleFailed(DWORD),
+    CStringNul(NulError),
+    LookupPrivilegeValueFailed(HRESULT),
+    GetSelfProcessTokenFailed(HRESULT),
+    AdjustTokenPrivilegesFailed(HRESULT),
+    FindFirstVolumeFailed(HRESULT),
+    FindNextVolumeFailed(HRESULT),
+    GetVolumePathNamesFailed(HRESULT),
+    OpenVolumeHandleFailed(HRESULT),
     MissingNullTerminator,
-    GetNtfsVolumeDataFailed(DWORD),
+    GetNtfsVolumeDataFailed(HRESULT),
     UnknownNtfsVersion,
     GetNtfsVolumeDataBadSize,
-    OpenMftFailed(DWORD),
-    GetRetrievalPointersFailed(DWORD),
-    ReadVolumeFailed(DWORD),
+    OpenMftFailed(HRESULT),
+    GetRetrievalPointersFailed(HRESULT),
+    ReadVolumeFailed(HRESULT),
     ReadVolumeTooShort,
     MftHasNoExtents,
     MftStartLcnNotFirstExtent,
@@ -36,7 +36,7 @@ pub enum Error {
 }
 impl From<NulError> for Error {
     fn from(err: NulError) -> Self {
-        Error::CStringNulError(err)
+        Error::CStringNul(err)
     }
 }
 impl std::error::Error for Error {}

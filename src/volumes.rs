@@ -1,23 +1,12 @@
 use crate::{err::Error, SafeHandle};
-
-use winapi::{
-    shared::winerror,
-    um::{
-        errhandlingapi as ehapi,
-        fileapi::{
-            CreateFile2, FindFirstVolumeW, FindNextVolumeW, FindVolumeClose,
-            GetVolumePathNamesForVolumeNameW, OPEN_EXISTING,
-        },
-        handleapi::INVALID_HANDLE_VALUE,
-        winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, HANDLE},
+use std::{ffi::OsString, os::windows::ffi::OsStringExt as _, ptr};
+use windows::Win32::{
+    Foundation::ERROR_NO_MORE_FILES,
+    Storage::FileSystem::{
+        CreateFile2, FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, FindVolumeHandle,
+        GetVolumePathNamesForVolumeNameW, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
     },
-};
-
-use std::{
-    convert::TryInto as _,
-    ffi::OsString,
-    os::windows::ffi::{OsStrExt as _, OsStringExt as _},
-    ptr,
 };
 
 #[derive(Debug)]
@@ -26,57 +15,81 @@ pub struct VolumeInfo {
     pub paths: Vec<OsString>,
 }
 impl VolumeInfo {
+    fn new(name: OsString, paths: Vec<OsString>) -> Self {
+        Self {
+            name: {
+                // Remove the trailing slash from the volume name.
+                // With the trailing slash, CreateFile will attempt to
+                // open the root directory of the volume instead of
+                // the volume itself.
+                let mut name = name.to_string_lossy().to_string();
+                name.pop();
+                name.into()
+            },
+            paths,
+        }
+    }
+
     pub fn get_handle(&self) -> Result<SafeHandle, Error> {
-        let filename = {
-            let mut filename = self.name.as_os_str().encode_wide().collect::<Vec<_>>();
-            // Replace the trailing backslash with a null terminator. We need the null
-            // terminator in general, and if the name ends in a backslash CreateFile
-            // will try to open the root directory of the volume instead.
-            *filename.last_mut().unwrap() = 0;
-            filename
-        };
-        let handle = unsafe {
+        match unsafe {
             CreateFile2(
-                filename.as_ptr(),
-                GENERIC_READ,
+                self.name.as_os_str(),
+                FILE_GENERIC_READ,
                 FILE_SHARE_WRITE | FILE_SHARE_READ,
                 OPEN_EXISTING,
                 ptr::null_mut(),
             )
-        };
-
-        if handle != INVALID_HANDLE_VALUE {
-            Ok(SafeHandle { handle })
-        } else {
-            let err = unsafe { ehapi::GetLastError() };
-            Err(Error::OpenVolumeHandleFailed(err))
+        } {
+            Ok(handle) => Ok(SafeHandle { handle }),
+            Err(err) => Err(Error::OpenVolumeHandleFailed(err.code())),
         }
     }
 }
 
 pub struct VolumeIterator {
-    iter_handle: HANDLE,
+    iter_handle: FindVolumeHandle,
     buffer: Vec<u16>,
     first_vol_name: Option<Result<OsString, Error>>,
 }
 impl VolumeIterator {
     pub fn new() -> Result<Self, Error> {
-        let mut buffer = vec![0; 1024];
-        let handle =
-            unsafe { FindFirstVolumeW(buffer.as_mut_ptr(), buffer.len().try_into().unwrap()) };
-
-        let first_vol_name = Some(VolumeIterator::parse_buffer(&buffer[..]));
-
-        if handle != INVALID_HANDLE_VALUE {
-            Ok(VolumeIterator {
-                iter_handle: handle,
-                buffer,
-                first_vol_name,
-            })
-        } else {
-            let err = unsafe { ehapi::GetLastError() };
-            Err(Error::FindFirstVolumeFailed(err))
+        let mut volume_name = vec![0; 1024];
+        match unsafe { FindFirstVolumeW(&mut volume_name[..]) } {
+            Ok(handle) => {
+                let name = Self::parse_buffer(&volume_name[..]);
+                Ok(Self {
+                    iter_handle: handle,
+                    buffer: volume_name,
+                    first_vol_name: Some(name),
+                })
+            }
+            Err(err) => Err(Error::FindFirstVolumeFailed(err.code())),
         }
+    }
+
+    fn get_paths_for_volume(&mut self, name: &OsString) -> Result<Vec<OsString>, Error> {
+        let mut return_size = 0u32;
+
+        unsafe {
+            GetVolumePathNamesForVolumeNameW(
+                name.as_os_str(),
+                &mut self.buffer[..],
+                &mut return_size,
+            )
+            .ok()
+        }
+        .map_err(|err| Error::GetVolumePathNamesFailed(err.code()))?;
+
+        Self::parse_string_list(&self.buffer[..])
+    }
+
+    fn parse_buffer(buf: &[u16]) -> Result<OsString, Error> {
+        let null_terminator_offset = buf
+            .iter()
+            .position(|x| *x == 0)
+            .ok_or(Error::MissingNullTerminator)?;
+
+        Ok(OsString::from_wide(&buf[0..null_terminator_offset]))
     }
 
     fn parse_string_list(mut buf: &[u16]) -> Result<Vec<OsString>, Error> {
@@ -96,40 +109,6 @@ impl VolumeIterator {
             }
         }
     }
-
-    fn get_paths_for_volume(&mut self, name: &OsString) -> Result<Vec<OsString>, Error> {
-        let mut size = 0;
-        let name = {
-            let mut name = name.as_os_str().encode_wide().collect::<Vec<_>>();
-            name.push(0);
-            name
-        };
-
-        let success = unsafe {
-            GetVolumePathNamesForVolumeNameW(
-                name.as_ptr(),
-                self.buffer.as_mut_ptr(),
-                self.buffer.len().try_into().unwrap(),
-                &mut size,
-            )
-        };
-
-        if success == 0 {
-            let err = unsafe { ehapi::GetLastError() };
-            return Err(Error::GetVolumePathNamesFailed(err));
-        }
-
-        VolumeIterator::parse_string_list(&self.buffer[..])
-    }
-
-    fn parse_buffer(buf: &[u16]) -> Result<OsString, Error> {
-        let null_terminator_offset = buf
-            .iter()
-            .position(|x| *x == 0)
-            .ok_or(Error::MissingNullTerminator)?;
-
-        Ok(OsString::from_wide(&buf[0..null_terminator_offset]))
-    }
 }
 impl Iterator for VolumeIterator {
     type Item = Result<VolumeInfo, Error>;
@@ -138,33 +117,21 @@ impl Iterator for VolumeIterator {
         if let Some(first_vol_name) = self.first_vol_name.take() {
             Some(first_vol_name.and_then(|name| {
                 self.get_paths_for_volume(&name)
-                    .map(|paths| VolumeInfo { name, paths })
+                    .map(|paths| VolumeInfo::new(name, paths))
             }))
         } else {
-            let success = unsafe {
-                FindNextVolumeW(
-                    self.iter_handle,
-                    self.buffer.as_mut_ptr(),
-                    self.buffer.len().try_into().unwrap(),
-                )
-            };
+            let result = unsafe { FindNextVolumeW(self.iter_handle, &mut self.buffer[..]).ok() };
 
-            if success == 0 {
-                let err = unsafe { ehapi::GetLastError() };
-
-                return if err == winerror::ERROR_NO_MORE_FILES {
-                    None
-                } else {
-                    Some(Err(Error::FindNextVolumeFailed(err)))
-                };
-            }
-
-            Some(
-                VolumeIterator::parse_buffer(&self.buffer[..]).and_then(|name| {
+            match result {
+                Ok(_) => Some(Self::parse_buffer(&self.buffer[..]).and_then(|name| {
                     self.get_paths_for_volume(&name)
-                        .map(|paths| VolumeInfo { name, paths })
-                }),
-            )
+                        .map(|paths| VolumeInfo::new(name, paths))
+                })),
+                Err(err) => match err.win32_error() {
+                    Some(ERROR_NO_MORE_FILES) => None,
+                    _ => Some(Err(Error::FindNextVolumeFailed(err.code()))),
+                },
+            }
         }
     }
 }

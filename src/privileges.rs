@@ -1,103 +1,76 @@
-use crate::err::Error;
-
-use winapi::{
-    shared::{minwindef::FALSE, ntdef::LUID, winerror},
-    um::{
-        errhandlingapi as ehapi,
-        processthreadsapi::{GetCurrentProcess, OpenProcessToken},
-        securitybaseapi::AdjustTokenPrivileges,
-        winbase::LookupPrivilegeValueA,
-        winnt,
+use windows::Win32::{
+    Foundation::{GetLastError, ERROR_SUCCESS, HANDLE, LUID},
+    Security::{
+        AdjustTokenPrivileges, LookupPrivilegeValueA, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    },
+    System::{
+        SystemServices::{SE_BACKUP_NAME, SE_RESTORE_NAME},
+        Threading::{GetCurrentProcess, OpenProcessToken},
     },
 };
 
-use std::{convert::TryInto as _, ffi::CString, mem, ptr};
+use crate::err::Error;
+
+use std::{mem, ptr};
 
 fn lookup_priv_id(name: &'static str) -> Result<LUID, Error> {
-    let priv_name = CString::new(name)?;
     let mut priv_id = LUID::default();
-    let success = unsafe { LookupPrivilegeValueA(ptr::null(), priv_name.as_ptr(), &mut priv_id) };
-
-    if success == 0 {
-        let err = unsafe { ehapi::GetLastError() };
-        return Err(Error::LookupPrivilegeValueFailed(err));
-    }
-
-    Ok(priv_id)
+    unsafe { LookupPrivilegeValueA(None, name, &mut priv_id).ok() }
+        .map(|_| priv_id)
+        .map_err(|err| Error::LookupPrivilegeValueFailed(err.code()))
 }
 
 pub fn has_sufficient_privileges() -> Result<bool, Error> {
     let my_token = {
         let my_process = unsafe { GetCurrentProcess() };
-        let mut token = ptr::null_mut();
-        let success =
-            unsafe { OpenProcessToken(my_process, winnt::TOKEN_ADJUST_PRIVILEGES, &mut token) };
-
-        if success == 0 {
-            let err = unsafe { ehapi::GetLastError() };
-            return Err(Error::GetSelfProcessTokenFailed(err));
-        }
+        let mut token = HANDLE::default();
+        unsafe { OpenProcessToken(my_process, TOKEN_ADJUST_PRIVILEGES, &mut token).ok() }
+            .map_err(|err| Error::GetSelfProcessTokenFailed(err.code()))?;
 
         token
     };
 
-    let mut backup_token_privs = winnt::TOKEN_PRIVILEGES {
+    let backup_token_privs = TOKEN_PRIVILEGES {
         PrivilegeCount: 1,
-        Privileges: [winnt::LUID_AND_ATTRIBUTES {
-            Luid: lookup_priv_id(winnt::SE_BACKUP_NAME)?,
-            Attributes: winnt::SE_PRIVILEGE_ENABLED,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: lookup_priv_id(SE_BACKUP_NAME)?,
+            Attributes: SE_PRIVILEGE_ENABLED,
         }],
     };
-    let mut restore_token_privs = winnt::TOKEN_PRIVILEGES {
+    let restore_token_privs = TOKEN_PRIVILEGES {
         PrivilegeCount: 1,
-        Privileges: [winnt::LUID_AND_ATTRIBUTES {
-            Luid: lookup_priv_id(winnt::SE_RESTORE_NAME)?,
-            Attributes: winnt::SE_PRIVILEGE_ENABLED,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: lookup_priv_id(SE_RESTORE_NAME)?,
+            Attributes: SE_PRIVILEGE_ENABLED,
         }],
     };
 
     // We call adjust twice since it's easier than hacking together memory
     // to form a C-style array.
 
-    let success = unsafe {
-        AdjustTokenPrivileges(
-            my_token,
-            FALSE,
-            &mut backup_token_privs,
-            mem::size_of::<winnt::TOKEN_PRIVILEGES>()
-                .try_into()
-                .unwrap(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-        )
-    };
-    let errcode = unsafe { ehapi::GetLastError() };
-    if success == 0 {
-        return Err(Error::AdjustTokenPrivilegesFailed(errcode));
-    } else if errcode != winerror::ERROR_SUCCESS {
-        // If we don't have permissions, the function returns success
-        // and sets the last error to ERROR_NOT_ALL_ASSIGNED. Let's be
-        // more defensive and assume any non-ERROR_SUCCESS means no permissions.
-        return Ok(false);
-    }
+    for privilege in [backup_token_privs, restore_token_privs] {
+        let result = unsafe {
+            AdjustTokenPrivileges(
+                my_token,
+                false,
+                &privilege,
+                mem::size_of::<TOKEN_PRIVILEGES>().try_into().unwrap(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
 
-    let success = unsafe {
-        AdjustTokenPrivileges(
-            my_token,
-            FALSE,
-            &mut restore_token_privs,
-            mem::size_of::<winnt::TOKEN_PRIVILEGES>()
-                .try_into()
-                .unwrap(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-        )
-    };
-    let errcode = unsafe { ehapi::GetLastError() };
-    if success == 0 {
-        return Err(Error::AdjustTokenPrivilegesFailed(errcode));
-    } else if errcode != winerror::ERROR_SUCCESS {
-        return Ok(false);
+        // AdjustTokenPrivileges is weird. Even if it indicates success, we need
+        // to GetLastError to determine if it *really* succeeded.
+        let err_code = unsafe { GetLastError() };
+        if result.as_bool() {
+            if err_code != ERROR_SUCCESS {
+                return Ok(false);
+            }
+        } else {
+            return Err(Error::AdjustTokenPrivilegesFailed(err_code.into()));
+        }
     }
 
     Ok(true)

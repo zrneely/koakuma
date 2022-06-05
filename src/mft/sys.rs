@@ -1,6 +1,6 @@
 use crate::{err::Error, mft::parse_string};
 
-use std::{convert::TryInto as _, ffi::OsString};
+use std::ffi::OsString;
 
 use super::AttributeName;
 

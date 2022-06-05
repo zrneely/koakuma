@@ -1,24 +1,20 @@
-use crate::{err::Error, SafeHandle};
-
-use winapi::{
-    ctypes::c_void,
-    shared::{minwindef::DWORD, winerror},
-    um::{
-        errhandlingapi as ehapi,
-        fileapi::ReadFile,
-        ioapiset::DeviceIoControl,
-        minwinbase::OVERLAPPED,
-        winioctl::{FSCTL_GET_RETRIEVAL_POINTERS, NTFS_VOLUME_DATA_BUFFER},
-        winnt::LONGLONG,
+use windows::Win32::{
+    Foundation::{GetLastError, ERROR_MORE_DATA},
+    Storage::FileSystem::ReadFile,
+    System::{
+        Ioctl::{FSCTL_GET_RETRIEVAL_POINTERS, NTFS_VOLUME_DATA_BUFFER},
+        IO::{DeviceIoControl, OVERLAPPED},
     },
 };
 
-use std::{convert::TryInto as _, mem, ptr};
+use crate::{err::Error, SafeHandle};
+
+use std::{ffi::c_void, mem, ptr};
 
 // Represents a continuous list of logical clusters in one file.
 #[derive(Debug, Clone, Copy)]
 struct Extent {
-    min_vcn: i64,
+    _min_vcn: i64,
     min_lcn: i64,
     cluster_count: i64,
 }
@@ -43,10 +39,8 @@ impl MftStream {
         volume_info: NTFS_VOLUME_DATA_BUFFER,
         file_handle: &SafeHandle,
     ) -> Result<Self, Error> {
-        let extents = load_file_extents(&file_handle)?;
-        if extents.first().ok_or(Error::MftHasNoExtents)?.min_lcn
-            != *unsafe { volume_info.MftStartLcn.QuadPart() }
-        {
+        let extents = load_file_extents(file_handle)?;
+        if extents.first().ok_or(Error::MftHasNoExtents)?.min_lcn != volume_info.MftStartLcn {
             return Err(Error::MftStartLcnNotFirstExtent);
         }
 
@@ -55,13 +49,8 @@ impl MftStream {
         Ok(MftStream {
             volume_handle,
             bytes_per_cluster,
-            bytes_per_file_record_segment: volume_info
-                .BytesPerFileRecordSegment
-                .try_into()
-                .unwrap(),
-            len: unsafe { *volume_info.MftValidDataLength.QuadPart() }
-                .try_into()
-                .unwrap(),
+            bytes_per_file_record_segment: volume_info.BytesPerFileRecordSegment.into(),
+            len: volume_info.MftValidDataLength.try_into().unwrap(),
             extents,
             // 16 MB is a reasonable tradeoff between perf and memory usage
             buffer: vec![0; 16 * 1024 * 1024],
@@ -125,6 +114,17 @@ impl MftStream {
         self.read_volume(volume_offset, buf, use_cache)
     }
 
+    fn create_overlapped(offset: u64) -> OVERLAPPED {
+        let mut overlapped = OVERLAPPED::default();
+        overlapped.Anonymous.Anonymous.Offset =
+            (offset & 0x0000_0000_FFFF_FFFFu64).try_into().unwrap();
+        overlapped.Anonymous.Anonymous.OffsetHigh = ((offset & 0xFFFF_FFFF_0000_0000u64) >> 32)
+            .try_into()
+            .unwrap();
+
+        overlapped
+    }
+
     fn read_volume(&mut self, offset: u64, buf: &mut [u8], use_cache: bool) -> Result<(), Error> {
         #[cfg(debug_assertions)]
         {
@@ -144,20 +144,10 @@ impl MftStream {
 
                 self.buffer_offset = offset;
 
-                let mut overlapped = {
-                    let offset: u64 = offset.try_into().unwrap();
-                    let mut ov = OVERLAPPED::default();
-                    unsafe { ov.u.s_mut() }.Offset =
-                        (offset & 0x0000_0000_FFFF_FFFFu64).try_into().unwrap();
-                    unsafe { ov.u.s_mut() }.OffsetHigh = ((offset & 0xFFFF_FFFF_0000_0000u64)
-                        >> 32)
-                        .try_into()
-                        .unwrap();
-                    ov
-                };
+                let mut overlapped = Self::create_overlapped(offset);
 
                 let mut num_bytes_read = 0;
-                let success = unsafe {
+                unsafe {
                     ReadFile(
                         *self.volume_handle,
                         self.buffer.as_mut_ptr() as *mut c_void,
@@ -165,11 +155,10 @@ impl MftStream {
                         &mut num_bytes_read,
                         &mut overlapped,
                     )
-                };
-                if success == 0 {
-                    let err = unsafe { ehapi::GetLastError() };
-                    return Err(Error::ReadVolumeFailed(err));
+                    .ok()
                 }
+                .map_err(|err| Error::ReadVolumeFailed(err.code()))?;
+
                 let num_bytes_read: usize = num_bytes_read.try_into().unwrap();
                 if num_bytes_read != self.buffer.len() {
                     return Err(Error::ReadVolumeTooShort);
@@ -180,19 +169,10 @@ impl MftStream {
             let buffer_end = buffer_start + buf.len();
             buf.copy_from_slice(&self.buffer[buffer_start..buffer_end]);
         } else {
-            let mut overlapped = {
-                let offset: u64 = offset.try_into().unwrap();
-                let mut ov = OVERLAPPED::default();
-                unsafe { ov.u.s_mut() }.Offset =
-                    (offset & 0x0000_0000_FFFF_FFFFu64).try_into().unwrap();
-                unsafe { ov.u.s_mut() }.OffsetHigh = ((offset & 0xFFFF_FFFF_0000_0000u64) >> 32)
-                    .try_into()
-                    .unwrap();
-                ov
-            };
+            let mut overlapped = Self::create_overlapped(offset);
 
             let mut num_bytes_read = 0;
-            let success = unsafe {
+            unsafe {
                 ReadFile(
                     *self.volume_handle,
                     buf.as_mut_ptr() as *mut c_void,
@@ -200,11 +180,10 @@ impl MftStream {
                     &mut num_bytes_read,
                     &mut overlapped,
                 )
-            };
-            if success == 0 {
-                let err = unsafe { ehapi::GetLastError() };
-                return Err(Error::ReadVolumeFailed(err));
+                .ok()
             }
+            .map_err(|err| Error::ReadVolumeFailed(err.code()))?;
+
             let num_bytes_read: usize = num_bytes_read.try_into().unwrap();
             if num_bytes_read != buf.len() {
                 return Err(Error::ReadVolumeTooShort);
@@ -225,71 +204,60 @@ fn load_file_extents(handle: &SafeHandle) -> Result<Vec<Extent>, Error> {
     loop {
         let mut result_size = 0;
 
-        let success = unsafe {
+        unsafe {
             DeviceIoControl(
                 **handle,
                 FSCTL_GET_RETRIEVAL_POINTERS,
-                &mut current_starting_vcn as *mut LONGLONG as *mut c_void,
-                mem::size_of::<LONGLONG>().try_into().unwrap(),
+                &mut current_starting_vcn as *mut i64 as *mut c_void,
+                mem::size_of::<i64>().try_into().unwrap(),
                 retrieval_buffer.as_mut_ptr() as *mut c_void,
                 retrieval_buffer.len().try_into().unwrap(),
                 &mut result_size,
                 ptr::null_mut(),
             )
-        };
-        let err = unsafe { ehapi::GetLastError() };
-        if success == 0 {
-            return Err(Error::GetRetrievalPointersFailed(err));
+            .ok()
         }
+        .map_err(|err| Error::GetRetrievalPointersFailed(err.code()))?;
 
         let mut returned_buffer = &retrieval_buffer[..result_size as usize];
 
         // The first DWORD in the buffer is the number of Extents returned.
-        let extent_count = DWORD::from_le_bytes(
-            returned_buffer[0..mem::size_of::<DWORD>()]
+        let extent_count = i32::from_le_bytes(
+            returned_buffer[0..mem::size_of::<i32>()]
                 .try_into()
                 .unwrap(),
         );
         // Note that we have now consumed sizeof(LONGLONG) bytes due to struct padding.
-        returned_buffer = &returned_buffer[mem::size_of::<LONGLONG>()..];
+        returned_buffer = &returned_buffer[mem::size_of::<i64>()..];
 
         // That's followed by a LARGE_INTEGER representing the first VCN mapping returned.
-        let mut min_vcn = LONGLONG::from_le_bytes(
-            returned_buffer[..mem::size_of::<LONGLONG>()]
-                .try_into()
-                .unwrap(),
-        );
-        returned_buffer = &returned_buffer[mem::size_of::<LONGLONG>()..];
+        let mut min_vcn =
+            i64::from_le_bytes(returned_buffer[..mem::size_of::<i64>()].try_into().unwrap());
+        returned_buffer = &returned_buffer[mem::size_of::<i64>()..];
 
         // Then, there's a list of tuples, each giving the starting LCN for the current
         // extent and the VCN that starts the next extent.
         let mut next_min_vcn = min_vcn;
 
         for _ in 0..extent_count {
-            next_min_vcn = LONGLONG::from_le_bytes(
-                returned_buffer[..mem::size_of::<LONGLONG>()]
-                    .try_into()
-                    .unwrap(),
-            );
-            returned_buffer = &returned_buffer[mem::size_of::<LONGLONG>()..];
+            next_min_vcn =
+                i64::from_le_bytes(returned_buffer[..mem::size_of::<i64>()].try_into().unwrap());
+            returned_buffer = &returned_buffer[mem::size_of::<i64>()..];
 
-            let min_lcn = LONGLONG::from_le_bytes(
-                returned_buffer[..mem::size_of::<LONGLONG>()]
-                    .try_into()
-                    .unwrap(),
-            );
-            returned_buffer = &returned_buffer[mem::size_of::<LONGLONG>()..];
+            let min_lcn =
+                i64::from_le_bytes(returned_buffer[..mem::size_of::<i64>()].try_into().unwrap());
+            returned_buffer = &returned_buffer[mem::size_of::<i64>()..];
 
             result.push(Extent {
                 min_lcn,
-                min_vcn,
+                _min_vcn: min_vcn,
                 cluster_count: next_min_vcn - min_vcn,
             });
             min_vcn = next_min_vcn;
         }
 
         current_starting_vcn = next_min_vcn;
-        if err != winerror::ERROR_MORE_DATA {
+        if unsafe { GetLastError() } != ERROR_MORE_DATA {
             break;
         }
     }

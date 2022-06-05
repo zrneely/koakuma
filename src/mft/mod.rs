@@ -1,26 +1,10 @@
 use crate::{err::Error, SafeHandle};
 
-use winapi::{
-    ctypes::c_void,
-    um::{
-        errhandlingapi as ehapi,
-        fileapi::{CreateFileW, OPEN_EXISTING},
-        handleapi::INVALID_HANDLE_VALUE,
-        ioapiset::DeviceIoControl,
-        winbase::FILE_FLAG_BACKUP_SEMANTICS,
-        winioctl::{
-            FSCTL_GET_NTFS_VOLUME_DATA, NTFS_EXTENDED_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER,
-        },
-        winnt::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE},
-    },
-};
-
 use std::{
     collections::HashSet,
-    convert::TryInto as _,
-    ffi::{OsStr, OsString},
+    ffi::{c_void, OsStr, OsString},
     mem,
-    os::windows::ffi::{OsStrExt as _, OsStringExt as _},
+    os::windows::ffi::OsStringExt as _,
     path::Path,
     ptr,
 };
@@ -29,6 +13,16 @@ mod stream;
 pub mod sys;
 
 use stream::MftStream;
+use windows::Win32::{
+    Storage::FileSystem::{
+        CreateFileW, FILE_ACCESS_FLAGS, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    },
+    System::{
+        Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_EXTENDED_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER},
+        IO::DeviceIoControl,
+    },
+};
 
 const NTFS_VOLUME_DATA_BUFFER_SIZE: usize =
     mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() + mem::size_of::<NTFS_EXTENDED_VOLUME_DATA>();
@@ -42,14 +36,14 @@ pub enum AttributeName {
     Custom(OsString),
 }
 // The string "$I30" in UTF-16
-const I30_BYTES: &'static [u8] = &[0x24, 0x00, 0x49, 0x00, 0x33, 0x00, 0x30, 0x00];
+const I30_BYTES: &[u8] = &[0x24, 0x00, 0x49, 0x00, 0x33, 0x00, 0x30, 0x00];
 // The string "Zone.Identifier" in UTF-16
-const ZONE_ID_BYTES: &'static [u8] = &[
+const ZONE_ID_BYTES: &[u8] = &[
     0x5A, 0x00, 0x6F, 0x00, 0x6E, 0x00, 0x65, 0x00, 0x2E, 0x00, 0x49, 0x00, 0x64, 0x00, 0x65, 0x00,
     0x6E, 0x00, 0x74, 0x00, 0x69, 0x00, 0x66, 0x00, 0x69, 0x00, 0x65, 0x00, 0x72, 0x00,
 ];
 // The string "$TXF_DATA" in UTF-16
-const TXF_DATA_BYTES: &'static [u8] = &[
+const TXF_DATA_BYTES: &[u8] = &[
     0x24, 0x00, 0x54, 0x00, 0x58, 0x00, 0x46, 0x00, 0x5f, 0x00, 0x44, 0x00, 0x41, 0x00, 0x54, 0x00,
     0x41, 0x00,
 ];
@@ -585,10 +579,10 @@ impl Iterator for MasterFileTable {
 fn get_ntfs_volume_data(
     handle: &SafeHandle,
 ) -> Result<(NTFS_VOLUME_DATA_BUFFER, NTFS_EXTENDED_VOLUME_DATA), Error> {
-    let mut result_size = 0;
     // Build the buffer out of u64s to guarantee 8-byte alignment.
     let mut buf: Vec<u64> = vec![0; NTFS_VOLUME_DATA_BUFFER_SIZE / 8];
-    let success = unsafe {
+    let mut result_size = 0;
+    unsafe {
         DeviceIoControl(
             **handle,
             FSCTL_GET_NTFS_VOLUME_DATA,
@@ -599,11 +593,9 @@ fn get_ntfs_volume_data(
             &mut result_size,
             ptr::null_mut(),
         )
-    };
-    if success == 0 {
-        let err = unsafe { ehapi::GetLastError() };
-        return Err(Error::GetNtfsVolumeDataFailed(err));
+        .ok()
     }
+    .map_err(|err| Error::GetNtfsVolumeDataFailed(err.code()))?;
 
     if result_size != (buf.len() as u32) * 8 {
         return Err(Error::GetNtfsVolumeDataBadSize);
@@ -633,30 +625,19 @@ fn get_mft_handle(volume_path: &OsStr) -> Result<SafeHandle, Error> {
         path.push("$MFT");
         path
     };
-    let filename = {
-        let mut filename = filename.as_os_str().encode_wide().collect::<Vec<_>>();
-        // Add a null terminator.
-        filename.push(0);
-        filename
-    };
-    let handle = unsafe {
+    unsafe {
         CreateFileW(
-            filename.as_ptr(),
-            0, // no permissions - we won't be reading or writing directly with this handle
+            filename.as_os_str(),
+            FILE_ACCESS_FLAGS(0), // no permissions - we won't be reading or writing directly with this handle
             FILE_SHARE_WRITE | FILE_SHARE_READ | FILE_SHARE_DELETE,
             ptr::null_mut(), // security attributes
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS,
-            ptr::null_mut(), // template file
+            None, // template file
         )
-    };
-
-    if handle != INVALID_HANDLE_VALUE {
-        Ok(SafeHandle { handle })
-    } else {
-        let err = unsafe { ehapi::GetLastError() };
-        Err(Error::OpenMftFailed(err))
     }
+    .map(|handle| SafeHandle { handle })
+    .map_err(|err| Error::OpenMftFailed(err.code()))
 }
 
 fn parse_runlist_unsigned_int(data: &[u8], width: u8) -> u64 {
