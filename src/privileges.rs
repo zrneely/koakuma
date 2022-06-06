@@ -18,7 +18,7 @@ fn lookup_priv_id(name: &'static str) -> Result<LUID, Error> {
     let mut priv_id = LUID::default();
     unsafe { LookupPrivilegeValueA(None, name, &mut priv_id).ok() }
         .map(|_| priv_id)
-        .map_err(|err| Error::LookupPrivilegeValueFailed(err.code()))
+        .map_err(|err| Error::LookupPrivilegeValueFailed(err))
 }
 
 pub fn has_sufficient_privileges() -> Result<bool, Error> {
@@ -26,7 +26,7 @@ pub fn has_sufficient_privileges() -> Result<bool, Error> {
         let my_process = unsafe { GetCurrentProcess() };
         let mut token = HANDLE::default();
         unsafe { OpenProcessToken(my_process, TOKEN_ADJUST_PRIVILEGES, &mut token).ok() }
-            .map_err(|err| Error::GetSelfProcessTokenFailed(err.code()))?;
+            .map_err(|err| Error::GetSelfProcessTokenFailed(err))?;
 
         token
     };

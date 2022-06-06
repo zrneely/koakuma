@@ -211,7 +211,7 @@ fn handle_volume(volume: volumes::VolumeInfo, options: &Options) -> Result<(), e
         if let Some(candidate_idx) = filesystem.allocated_size_heap.pop() {
             if candidate_idx.index < 24 {
                 // The first 24 files are special and shouldn't be reported to the user.
-                // See https://flatcap.org/linux-ntfs/ntfs/files/index.html.
+                // See https://flatcap.github.io/linux-ntfs/ntfs/files/index.html.
                 continue;
             }
 

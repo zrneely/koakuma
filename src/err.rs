@@ -1,24 +1,25 @@
-use windows::core::HRESULT;
+use windows::core::Error as WinError;
 
 use std::{ffi::NulError, fmt};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Error {
     CStringNul(NulError),
-    LookupPrivilegeValueFailed(HRESULT),
-    GetSelfProcessTokenFailed(HRESULT),
-    AdjustTokenPrivilegesFailed(HRESULT),
-    FindFirstVolumeFailed(HRESULT),
-    FindNextVolumeFailed(HRESULT),
-    GetVolumePathNamesFailed(HRESULT),
-    OpenVolumeHandleFailed(HRESULT),
+    LookupPrivilegeValueFailed(WinError),
+    GetSelfProcessTokenFailed(WinError),
+    AdjustTokenPrivilegesFailed(WinError),
+    FindFirstVolumeFailed(WinError),
+    FindNextVolumeFailed(WinError),
+    GetVolumePathNamesFailed(WinError),
+    GetVolumeNameFailed(WinError),
+    OpenVolumeHandleFailed(WinError),
     MissingNullTerminator,
-    GetNtfsVolumeDataFailed(HRESULT),
+    GetNtfsVolumeDataFailed(WinError),
     UnknownNtfsVersion,
     GetNtfsVolumeDataBadSize,
-    OpenMftFailed(HRESULT),
-    GetRetrievalPointersFailed(HRESULT),
-    ReadVolumeFailed(HRESULT),
+    OpenMftFailed(WinError),
+    GetRetrievalPointersFailed(WinError),
+    ReadVolumeFailed(WinError),
     ReadVolumeTooShort,
     MftHasNoExtents,
     MftStartLcnNotFirstExtent,
@@ -33,6 +34,7 @@ pub enum Error {
     BadMultiSectorHeaderSignature,
     UpdateSequenceValidationFailed,
     AttributeListPointedToUnusedFileRecord,
+    OperationCancelled,
 }
 impl From<NulError> for Error {
     fn from(err: NulError) -> Self {

@@ -1,48 +1,97 @@
 use crate::{err::Error, SafeHandle};
-use std::{ffi::OsString, os::windows::ffi::OsStringExt as _, ptr};
+use std::{ffi::OsString, fmt::Display, os::windows::ffi::OsStringExt as _, ptr};
 use windows::Win32::{
-    Foundation::ERROR_NO_MORE_FILES,
+    Foundation::{ERROR_NO_MORE_FILES, MAX_PATH},
     Storage::FileSystem::{
         CreateFile2, FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, FindVolumeHandle,
-        GetVolumePathNamesForVolumeNameW, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        OPEN_EXISTING,
+        GetVolumeInformationW, GetVolumePathNamesForVolumeNameW, FILE_GENERIC_READ,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     },
 };
 
-#[derive(Debug)]
+fn parse_buffer(buf: &[u16]) -> Result<OsString, Error> {
+    let null_terminator_offset = buf
+        .iter()
+        .position(|x| *x == 0)
+        .ok_or(Error::MissingNullTerminator)?;
+
+    Ok(OsString::from_wide(&buf[0..null_terminator_offset]))
+}
+
+#[derive(Debug, Clone)]
 pub struct VolumeInfo {
-    pub name: OsString,
+    pub unc_name: OsString,
     pub paths: Vec<OsString>,
+    name: Result<OsString, Error>,
 }
 impl VolumeInfo {
-    fn new(name: OsString, paths: Vec<OsString>) -> Self {
+    fn new(unc_name: OsString, paths: Vec<OsString>) -> Self {
+        let name = Self::get_volume_name(&unc_name);
+
+        // Remove the trailing slash from the volume name.
+        // With the trailing slash, CreateFile will attempt to
+        // open the root directory of the volume instead of
+        // the volume itself.
+        let mut unc_name = unc_name.to_string_lossy().to_string();
+        unc_name.pop();
+        let unc_name = unc_name.into();
+
         Self {
-            name: {
-                // Remove the trailing slash from the volume name.
-                // With the trailing slash, CreateFile will attempt to
-                // open the root directory of the volume instead of
-                // the volume itself.
-                let mut name = name.to_string_lossy().to_string();
-                name.pop();
-                name.into()
-            },
+            name,
+            unc_name,
             paths,
         }
     }
 
     pub fn get_handle(&self) -> Result<SafeHandle, Error> {
-        match unsafe {
+        unsafe {
             CreateFile2(
-                self.name.as_os_str(),
+                self.unc_name.as_os_str(),
                 FILE_GENERIC_READ,
                 FILE_SHARE_WRITE | FILE_SHARE_READ,
                 OPEN_EXISTING,
                 ptr::null_mut(),
             )
-        } {
-            Ok(handle) => Ok(SafeHandle { handle }),
-            Err(err) => Err(Error::OpenVolumeHandleFailed(err.code())),
         }
+        .map(|handle| SafeHandle { handle })
+        .map_err(|err| Error::OpenVolumeHandleFailed(err))
+    }
+
+    fn get_volume_name(unc_name: &OsString) -> Result<OsString, Error> {
+        let mut buffer = vec![0u16; MAX_PATH as usize];
+        let mut buffer2 = vec![0u16; 0];
+        unsafe {
+            GetVolumeInformationW(
+                unc_name.as_os_str(),
+                &mut buffer[..],
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut buffer2[..],
+            )
+            .ok()
+        }
+        .map_err(|err| Error::GetVolumeNameFailed(err))
+        .and_then(|_| parse_buffer(&buffer[..]))
+    }
+}
+impl Display for VolumeInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            self.paths
+                .get(0)
+                .map(|path| path.to_string_lossy())
+                .unwrap_or_else(|| self.unc_name.to_string_lossy())
+        )?;
+
+        match self.name {
+            Ok(ref volume_name) if volume_name.len() > 0 => write!(f, " ({})", volume_name.to_string_lossy())?,
+            _ => {}
+        }
+
+        Ok(())
     }
 }
 
@@ -56,14 +105,14 @@ impl VolumeIterator {
         let mut volume_name = vec![0; 1024];
         match unsafe { FindFirstVolumeW(&mut volume_name[..]) } {
             Ok(handle) => {
-                let name = Self::parse_buffer(&volume_name[..]);
+                let name = parse_buffer(&volume_name[..]);
                 Ok(Self {
                     iter_handle: handle,
                     buffer: volume_name,
                     first_vol_name: Some(name),
                 })
             }
-            Err(err) => Err(Error::FindFirstVolumeFailed(err.code())),
+            Err(err) => Err(Error::FindFirstVolumeFailed(err)),
         }
     }
 
@@ -78,18 +127,9 @@ impl VolumeIterator {
             )
             .ok()
         }
-        .map_err(|err| Error::GetVolumePathNamesFailed(err.code()))?;
+        .map_err(|err| Error::GetVolumePathNamesFailed(err))?;
 
         Self::parse_string_list(&self.buffer[..])
-    }
-
-    fn parse_buffer(buf: &[u16]) -> Result<OsString, Error> {
-        let null_terminator_offset = buf
-            .iter()
-            .position(|x| *x == 0)
-            .ok_or(Error::MissingNullTerminator)?;
-
-        Ok(OsString::from_wide(&buf[0..null_terminator_offset]))
     }
 
     fn parse_string_list(mut buf: &[u16]) -> Result<Vec<OsString>, Error> {
@@ -123,13 +163,13 @@ impl Iterator for VolumeIterator {
             let result = unsafe { FindNextVolumeW(self.iter_handle, &mut self.buffer[..]).ok() };
 
             match result {
-                Ok(_) => Some(Self::parse_buffer(&self.buffer[..]).and_then(|name| {
+                Ok(_) => Some(parse_buffer(&self.buffer[..]).and_then(|name| {
                     self.get_paths_for_volume(&name)
                         .map(|paths| VolumeInfo::new(name, paths))
                 })),
                 Err(err) => match err.win32_error() {
                     Some(ERROR_NO_MORE_FILES) => None,
-                    _ => Some(Err(Error::FindNextVolumeFailed(err.code()))),
+                    _ => Some(Err(Error::FindNextVolumeFailed(err))),
                 },
             }
         }

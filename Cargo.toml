@@ -8,7 +8,7 @@ description = "Finds big files and folders"
 [features]
 cli = ["clap", "indicatif"]
 gui = ["egui", "eframe", "winres"]
-default = ["cli"]
+default = ["gui"]
 
 [profile.release]
 lto = true

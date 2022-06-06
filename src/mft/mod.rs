@@ -82,7 +82,7 @@ pub struct MasterFileTable {
     current_file_record_segment: u64,
 }
 impl MasterFileTable {
-    pub fn load(volume_handle: SafeHandle, volume_path: &OsStr) -> Result<(Self, u64), Error> {
+    pub fn load(volume_handle: SafeHandle, volume_path: &OsStr) -> Result<Self, Error> {
         let (volume_data, extended_data) = get_ntfs_volume_data(&volume_handle)?;
 
         // We only know how to deal with NTFS 3.0 or 3.1 data. Make sure the volume
@@ -95,20 +95,21 @@ impl MasterFileTable {
 
         let mft_handle = get_mft_handle(volume_path)?;
 
-        Ok((
-            MasterFileTable {
-                mft_stream: MftStream::new(volume_handle, volume_data, &mft_handle)?,
-                bytes_per_file_record_segment: volume_data.BytesPerFileRecordSegment.into(),
-                bytes_per_sector: volume_data.BytesPerSector.into(),
-                bytes_per_cluster: volume_data.BytesPerCluster.into(),
-                current_file_record_segment: 0,
-            },
-            volume_data.BytesPerCluster.into(),
-        ))
+        Ok(MasterFileTable {
+            mft_stream: MftStream::new(volume_handle, volume_data, &mft_handle)?,
+            bytes_per_file_record_segment: volume_data.BytesPerFileRecordSegment.into(),
+            bytes_per_sector: volume_data.BytesPerSector.into(),
+            bytes_per_cluster: volume_data.BytesPerCluster.into(),
+            current_file_record_segment: 0,
+        })
     }
 
     pub fn entry_count(&self) -> u64 {
         self.mft_stream.get_file_record_segment_count()
+    }
+
+    pub fn bytes_per_cluster(&self) -> u64 {
+        self.bytes_per_cluster
     }
 
     // private helpers
@@ -595,7 +596,7 @@ fn get_ntfs_volume_data(
         )
         .ok()
     }
-    .map_err(|err| Error::GetNtfsVolumeDataFailed(err.code()))?;
+    .map_err(|err| Error::GetNtfsVolumeDataFailed(err))?;
 
     if result_size != (buf.len() as u32) * 8 {
         return Err(Error::GetNtfsVolumeDataBadSize);
@@ -637,7 +638,7 @@ fn get_mft_handle(volume_path: &OsStr) -> Result<SafeHandle, Error> {
         )
     }
     .map(|handle| SafeHandle { handle })
-    .map_err(|err| Error::OpenMftFailed(err.code()))
+    .map_err(|err| Error::OpenMftFailed(err))
 }
 
 fn parse_runlist_unsigned_int(data: &[u8], width: u8) -> u64 {
