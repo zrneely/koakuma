@@ -36,10 +36,13 @@ enum AppState {
     SelectingDrive {
         all_drives: Vec<VolumeInfo>,
         selected_idx: usize,
+        analyze_clicked: bool,
     },
     AnalyzingDrive {
         task: RunningTask<FilesystemAnalysisUpdate>,
-        percent_complete: f64,
+        percent_complete: f32,
+        total_entries: u64,
+        processed_entries: u64,
     },
     AnalysisFinished,
 }
@@ -56,11 +59,12 @@ impl KoakumaApp {
     }
 }
 impl App for KoakumaApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut Frame) {
-        self.update_state();
+    fn update(&mut self, ctx: &egui::Context, _: &mut Frame) {
+        self.update_state(ctx);
 
         self.draw_loading_volume_list_state(ctx);
         self.draw_selecting_volume_state(ctx);
+        self.draw_loading_analysis_state(ctx);
     }
 }
 impl KoakumaApp {
@@ -74,17 +78,20 @@ impl KoakumaApp {
             task: task::spawn_task(ctx, move |cancel_flag, callback| {
                 sync_parse_drive_contents(&volume, cancel_flag, callback)
             }),
-            percent_complete: 0f64,
+            percent_complete: 0f32,
+            total_entries: 0,
+            processed_entries: 0,
         }
     }
 
-    fn update_state(&mut self) {
+    fn update_state(&mut self, ctx: &Context) {
         match self.state {
             AppState::LoadingVolumeList(ref task) => match task.poll() {
                 Some(VolumeListUpdate::Finished(all_drives)) => {
                     self.state = AppState::SelectingDrive {
                         all_drives,
                         selected_idx: 0,
+                        analyze_clicked: false,
                     };
                 }
                 Some(VolumeListUpdate::Error(err)) => {
@@ -92,19 +99,36 @@ impl KoakumaApp {
                 }
                 None => {}
             },
-            AppState::SelectingDrive { .. } => {}
+            AppState::SelectingDrive {
+                analyze_clicked,
+                ref all_drives,
+                selected_idx,
+            } => {
+                if analyze_clicked {
+                    self.state =
+                        Self::create_analyzing_drive_state(ctx, all_drives[selected_idx].clone());
+                }
+            }
             AppState::AnalyzingDrive {
                 ref task,
                 ref mut percent_complete,
+                ref mut total_entries,
+                ref mut processed_entries,
             } => match task.poll() {
                 Some(FilesystemAnalysisUpdate::Finished(_)) => {
-                    todo!("handle results of fs analysis")
+                    println!("Analysis finished!");
+                    self.state = AppState::AnalysisFinished;
                 }
                 Some(FilesystemAnalysisUpdate::Error(err)) => todo!("handle error in fs analysis"),
-                Some(FilesystemAnalysisUpdate::Update { segments_processed, total_segments }) => {
-                    *percent_complete = (segments_processed as f64) / (total_segments as f64);
+                Some(FilesystemAnalysisUpdate::Update {
+                    segments_processed,
+                    total_segments,
+                }) => {
+                    *percent_complete = (segments_processed as f32) / (total_segments as f32);
+                    *total_entries = total_segments;
+                    *processed_entries = segments_processed;
                 }
-                None => {},
+                None => {}
             },
             AppState::AnalysisFinished => {}
         }
@@ -119,10 +143,10 @@ impl KoakumaApp {
     }
 
     fn draw_selecting_volume_state(&mut self, ctx: &Context) {
-        let mut analyze_target = None;
         if let AppState::SelectingDrive {
             ref all_drives,
             ref mut selected_idx,
+            ref mut analyze_clicked,
         } = self.state
         {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -130,20 +154,52 @@ impl KoakumaApp {
 
                 egui::ComboBox::from_id_source("volume_selector")
                     .selected_text(format!("{}", all_drives[*selected_idx]))
+                    .width(ui.available_width() - ui.spacing().item_spacing.x)
                     .show_ui(ui, |ui| {
                         for (i, volume) in all_drives.iter().enumerate() {
                             ui.selectable_value(selected_idx, i, format!("{}", volume));
                         }
                     });
 
+                ui.add_space(5.0);
+
                 if ui.button("Analyze!").clicked() {
-                    analyze_target = Some(all_drives[*selected_idx].clone());
+                    *analyze_clicked = true;
+                    ctx.request_repaint();
                 }
             });
         }
+    }
 
-        if let Some(analyze_target) = analyze_target {
-            self.state = Self::create_analyzing_drive_state(ctx, analyze_target);
+    fn draw_loading_analysis_state(&mut self, ctx: &Context) {
+        if let AppState::AnalyzingDrive {
+            percent_complete,
+            total_entries,
+            processed_entries,
+            ref task,
+        } = self.state
+        {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label("Reading volume...");
+
+                ui.add_space(5.0);
+
+                let progress_bar = egui::ProgressBar::new(percent_complete).text(format!(
+                    "{} / {} ({:.2}%)",
+                    processed_entries,
+                    total_entries,
+                    percent_complete * 100f32
+                ));
+                ui.add(progress_bar);
+
+                // ui.add_space(100.0);
+
+                let button = egui::Button::new("Cancel");
+                if ui.add(button).clicked() {
+                    println!("Cancelling...");
+                    task.cancel();
+                }
+            });
         }
     }
 }
@@ -196,9 +252,39 @@ fn sync_parse_drive_contents_helper<F>(
 where
     F: Fn(FilesystemAnalysisUpdate),
 {
-    let mft = mft::MasterFileTable::load(volume.get_handle()?, &volume.paths[0])?;
+    let mut mft = mft::MasterFileTable::load(volume.get_handle()?, &volume.paths[0])?;
+    let total_segments = mft.entry_count();
+    progress_callback(FilesystemAnalysisUpdate::Update {
+        segments_processed: 0,
+        total_segments,
+    });
 
-    std::thread::sleep(std::time::Duration::from_secs(5));
+    // Read entries in blocks of 500
+    let mut buf = Vec::with_capacity(500);
+    let mut reached_end = false;
+    let mut total_processed = 0;
+    while !reached_end && !cancel_flag.load(Ordering::SeqCst) {
+        for _ in 0..500 {
+            buf.push(match mft.next() {
+                Some(val) => val?,
+                None => {
+                    reached_end = true;
+                    break;
+                }
+            });
+        }
 
-    Ok(())
+        total_processed += buf.len() as u64;
+        buf.clear(); // TODO: do something with the entries lmao
+        progress_callback(FilesystemAnalysisUpdate::Update {
+            segments_processed: total_processed,
+            total_segments,
+        });
+    }
+
+    if cancel_flag.load(Ordering::SeqCst) {
+        Err(Error::OperationCancelled)
+    } else {
+        Ok(())
+    }
 }

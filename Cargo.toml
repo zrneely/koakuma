@@ -11,7 +11,7 @@ gui = ["egui", "eframe", "winres"]
 default = ["gui"]
 
 [profile.release]
-lto = true
+# lto = true
 # debug = true
 
 [build-dependencies]
