@@ -61,8 +61,11 @@ impl MftEntry {
         self.filename.first().map(|e| e.filename.clone())
     }
 
-    pub fn parents(&self) -> Vec<u64> {
-        self.filename.iter().map(|f| f.parent).collect()
+    pub fn parents<'a>(&'a self) -> impl Iterator<Item = u64> + 'a {
+        MftEntryParentIterator {
+            entry: self,
+            idx: 0,
+        }
     }
 
     pub fn get_allocated_size(&self, bytes_per_cluster: u64, only_alt: bool) -> u64 {
@@ -71,6 +74,20 @@ impl MftEntry {
             .filter(|data| !(only_alt && matches!(data.name, AttributeName::None)))
             .map(|data| data.compute_allocated_size(bytes_per_cluster))
             .sum()
+    }
+}
+
+struct MftEntryParentIterator<'a> {
+    entry: &'a MftEntry,
+    idx: usize,
+}
+impl<'a> Iterator for MftEntryParentIterator<'a> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let fname = self.entry.filename.get(self.idx).map(|fname| fname.parent);
+        self.idx += 1;
+        fname
     }
 }
 

@@ -102,9 +102,10 @@ impl Filesystem {
         let allowed_hidden = self.count_hidden || !entry.standard_information[0].flags.is_hidden;
 
         if allowed_system && allowed_hidden {
-            let extension = entry
-                .get_best_filename()
-                .and_then(|fname| Path::new(&fname).extension().map(|ext| ext.to_os_string()));
+            let extension = {
+                let fname = entry.get_best_filename();
+                fname.and_then(|fname| Path::new(&fname).extension().map(|ext| ext.to_os_string()))
+            };
 
             let allowed_whitelist = if let Some(ref whitelist) = self.extension_whitelist {
                 if let Some(ref extension) = extension {
@@ -167,11 +168,11 @@ impl Filesystem {
         let mut parts = Vec::new();
 
         loop {
-            let parents = entry.parents();
+            let parents = entry.parents().next().unwrap();
 
-            if parents[0] != entry.base_record_segment_idx {
-                parts.push(entry.get_best_filename()?);
-                entry = self.entries.get(&parents[0])?;
+            if parents != entry.base_record_segment_idx {
+                parts.push(entry.get_best_filename().unwrap());
+                entry = self.entries.get(&parents)?;
             } else {
                 break;
             }

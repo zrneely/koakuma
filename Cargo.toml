@@ -23,6 +23,7 @@ eframe = { version = "0.18", optional=true }
 
 clap = { version = "3", optional=true }
 indicatif = { version = "0.16", optional=true }
+smallvec = "1.8.0"
 
 [dependencies.windows]
 version = "0.37"

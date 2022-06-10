@@ -1,9 +1,15 @@
-use std::{sync::{mpsc::{Receiver, self}, atomic::{AtomicBool, Ordering}, Arc}, thread};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+};
 
 use egui::Context;
 
 pub struct RunningTask<T: Send + 'static> {
-    update_receiver: Receiver<T>,
+    progress: Arc<Mutex<Option<T>>>,
     cancel_flag: Arc<AtomicBool>,
 }
 impl<T: Send + 'static> RunningTask<T> {
@@ -11,31 +17,42 @@ impl<T: Send + 'static> RunningTask<T> {
         self.cancel_flag.store(true, Ordering::SeqCst);
     }
 
-    pub fn poll(&self) -> Option<T> {
-        self.update_receiver.try_recv().ok()
+    /// Returns None if there is no update since the last time asked
+    pub fn get_most_recent_update(&self) -> Option<T> {
+        self.progress.lock().unwrap().take()
     }
 }
 
-pub fn spawn_task<Task,  Update>(ctx: &Context, task: Task) -> RunningTask<Update>
+pub fn spawn_task<Task, Update>(ctx: &Context, task: Task) -> RunningTask<Update>
 where
     Task: (Fn(Arc<AtomicBool>, Box<dyn Fn(Update) + Send>) -> Update) + Send + 'static,
     Update: Send + 'static,
 {
-    let (update_sender, update_receiver) = mpsc::channel();
-    let final_update_sender = update_sender.clone();
+    let ctx_for_remote = ctx.clone();
+    let ctx_final = ctx.clone();
 
-    let ctx = ctx.clone();
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let cancel_flag_for_remote = cancel_flag.clone();
 
-    thread::spawn(move || {
-        let result = task(cancel_flag_for_remote, Box::new(move |update| {
-            update_sender.send(update).unwrap();
-            ctx.request_repaint();
-        }));
+    let progress = Arc::new(Mutex::new(None));
+    let progress_for_remote = progress.clone();
+    let progress_final = progress.clone();
 
-        final_update_sender.send(result).unwrap();
+    thread::spawn(move || {
+        let result = task(
+            cancel_flag_for_remote,
+            Box::new(move |update| {
+                *progress_for_remote.lock().unwrap() = Some(update);
+                ctx_for_remote.request_repaint();
+            }),
+        );
+
+        *progress_final.lock().unwrap() = Some(result);
+        ctx_final.request_repaint();
     });
 
-    RunningTask { update_receiver, cancel_flag }
+    RunningTask {
+        progress,
+        cancel_flag,
+    }
 }

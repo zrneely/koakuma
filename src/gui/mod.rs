@@ -10,15 +10,15 @@ use crate::{
     err::Error,
     mft,
     volumes::{VolumeInfo, VolumeIterator},
-    Filesystem,
 };
 
-use self::task::RunningTask;
+use self::{task::RunningTask, treemap::FilesystemData};
 
 mod task;
+mod treemap;
 
 enum FilesystemAnalysisUpdate {
-    Finished(()), // TODO: actual type lmao
+    Finished(FilesystemData),
     Update {
         segments_processed: u64,
         total_segments: u64,
@@ -86,7 +86,7 @@ impl KoakumaApp {
 
     fn update_state(&mut self, ctx: &Context) {
         match self.state {
-            AppState::LoadingVolumeList(ref task) => match task.poll() {
+            AppState::LoadingVolumeList(ref task) => match task.get_most_recent_update() {
                 Some(VolumeListUpdate::Finished(all_drives)) => {
                     self.state = AppState::SelectingDrive {
                         all_drives,
@@ -114,7 +114,7 @@ impl KoakumaApp {
                 ref mut percent_complete,
                 ref mut total_entries,
                 ref mut processed_entries,
-            } => match task.poll() {
+            } => match task.get_most_recent_update() {
                 Some(FilesystemAnalysisUpdate::Finished(_)) => {
                     println!("Analysis finished!");
                     self.state = AppState::AnalysisFinished;
@@ -239,7 +239,7 @@ where
     F: Fn(FilesystemAnalysisUpdate),
 {
     match sync_parse_drive_contents_helper(volume, cancel_flag, progress_callback) {
-        Ok(_) => FilesystemAnalysisUpdate::Finished(()),
+        Ok(filesystem_data) => FilesystemAnalysisUpdate::Finished(filesystem_data),
         Err(err) => FilesystemAnalysisUpdate::Error(err),
     }
 }
@@ -248,7 +248,7 @@ fn sync_parse_drive_contents_helper<F>(
     volume: &VolumeInfo,
     cancel_flag: Arc<AtomicBool>,
     progress_callback: F,
-) -> Result<(), Error>
+) -> Result<FilesystemData, Error>
 where
     F: Fn(FilesystemAnalysisUpdate),
 {
@@ -260,13 +260,17 @@ where
     });
 
     // Read entries in blocks of 500
-    let mut buf = Vec::with_capacity(500);
+    let mut filesystem_data =
+        FilesystemData::new(mft.bytes_per_cluster(), mft.entry_count() as usize);
     let mut reached_end = false;
     let mut total_processed = 0;
     while !reached_end && !cancel_flag.load(Ordering::SeqCst) {
         for _ in 0..500 {
-            buf.push(match mft.next() {
-                Some(val) => val?,
+            filesystem_data.add_entry(match mft.next() {
+                Some(val) => {
+                    total_processed += 1;
+                    val?
+                }
                 None => {
                     reached_end = true;
                     break;
@@ -274,17 +278,22 @@ where
             });
         }
 
-        total_processed += buf.len() as u64;
-        buf.clear(); // TODO: do something with the entries lmao
         progress_callback(FilesystemAnalysisUpdate::Update {
             segments_processed: total_processed,
             total_segments,
         });
     }
 
+    let start = std::time::Instant::now();
+    filesystem_data.populate_children();
+    println!(
+        "Populated children in {:?}",
+        std::time::Instant::now() - start
+    );
+
     if cancel_flag.load(Ordering::SeqCst) {
         Err(Error::OperationCancelled)
     } else {
-        Ok(())
+        Ok(filesystem_data)
     }
 }
