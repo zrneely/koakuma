@@ -8,12 +8,14 @@ use egui::Context;
 
 use crate::{
     err::Error,
+    gui::filesystem::FilesystemDataBuilder,
     mft,
     volumes::{VolumeInfo, VolumeIterator},
 };
 
-use self::{task::RunningTask, treemap::FilesystemData};
+use self::{filesystem::FilesystemData, task::RunningTask, treemap::Treemap};
 
+mod filesystem;
 mod task;
 mod treemap;
 
@@ -44,7 +46,9 @@ enum AppState {
         total_entries: u64,
         processed_entries: u64,
     },
-    AnalysisFinished,
+    AnalysisFinished {
+        map: Treemap,
+    },
 }
 
 pub struct KoakumaApp {
@@ -65,6 +69,7 @@ impl App for KoakumaApp {
         self.draw_loading_volume_list_state(ctx);
         self.draw_selecting_volume_state(ctx);
         self.draw_loading_analysis_state(ctx);
+        self.draw_analysis_finished_state(ctx);
     }
 }
 impl KoakumaApp {
@@ -115,9 +120,11 @@ impl KoakumaApp {
                 ref mut total_entries,
                 ref mut processed_entries,
             } => match task.get_most_recent_update() {
-                Some(FilesystemAnalysisUpdate::Finished(_)) => {
+                Some(FilesystemAnalysisUpdate::Finished(fs_data)) => {
                     println!("Analysis finished!");
-                    self.state = AppState::AnalysisFinished;
+                    self.state = AppState::AnalysisFinished {
+                        map: Treemap::new(fs_data),
+                    };
                 }
                 Some(FilesystemAnalysisUpdate::Error(err)) => todo!("handle error in fs analysis"),
                 Some(FilesystemAnalysisUpdate::Update {
@@ -130,7 +137,7 @@ impl KoakumaApp {
                 }
                 None => {}
             },
-            AppState::AnalysisFinished => {}
+            AppState::AnalysisFinished { .. } => {}
         }
     }
 
@@ -192,13 +199,21 @@ impl KoakumaApp {
                 ));
                 ui.add(progress_bar);
 
-                // ui.add_space(100.0);
+                ui.add_space(5.0);
 
                 let button = egui::Button::new("Cancel");
                 if ui.add(button).clicked() {
                     println!("Cancelling...");
                     task.cancel();
                 }
+            });
+        }
+    }
+
+    fn draw_analysis_finished_state(&mut self, ctx: &Context) {
+        if let AppState::AnalysisFinished { ref mut map } = &mut self.state {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(map);
             });
         }
     }
@@ -261,7 +276,7 @@ where
 
     // Read entries in blocks of 500
     let mut filesystem_data =
-        FilesystemData::new(mft.bytes_per_cluster(), mft.entry_count() as usize);
+        FilesystemDataBuilder::new(mft.bytes_per_cluster(), mft.entry_count() as usize);
     let mut reached_end = false;
     let mut total_processed = 0;
     while !reached_end && !cancel_flag.load(Ordering::SeqCst) {
@@ -285,7 +300,7 @@ where
     }
 
     let start = std::time::Instant::now();
-    filesystem_data.populate_children();
+    let filesystem_data = filesystem_data.finish();
     println!(
         "Populated children in {:?}",
         std::time::Instant::now() - start

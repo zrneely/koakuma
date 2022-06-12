@@ -660,6 +660,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "humansize"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02296996cb8796d7c6e3bc2d9211b7802812d36999a51bb754123ead7d37d026"
+
+[[package]]
 name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -752,8 +758,10 @@ dependencies = [
  "clap",
  "eframe",
  "egui",
+ "humansize",
  "indicatif",
  "smallvec",
+ "treemap",
  "windows",
  "winres",
 ]
@@ -1382,6 +1390,12 @@ checksum = "f54c8ca710e81886d498c2fd3331b56c93aa248d49de2222ad2742247c60072f"
 dependencies = [
  "lazy_static",
 ]
+
+[[package]]
+name = "treemap"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1571f89da27a5e1aa83304ee1ab9519ea8c6432b4c8903aaaa6c9a9eecb6f36"
 
 [[package]]
 name = "ttf-parser"

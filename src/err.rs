@@ -35,6 +35,9 @@ pub enum Error {
     UpdateSequenceValidationFailed,
     AttributeListPointedToUnusedFileRecord,
     OperationCancelled,
+    NoSuchNode,
+    MissingParent,
+    TreeNavigatedToFile,
 }
 impl From<NulError> for Error {
     fn from(err: NulError) -> Self {
