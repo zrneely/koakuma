@@ -11,7 +11,7 @@ use super::filesystem::FilesystemData;
 fn egui_to_treemap(inp: &egui::Rect) -> treemap::Rect {
     treemap::Rect {
         x: inp.left() as f64,
-        y: inp.right() as f64,
+        y: inp.top() as f64,
         w: inp.width() as f64,
         h: inp.height() as f64,
     }
@@ -53,9 +53,9 @@ impl DrawableRectangle {
         Ok(DrawableRectangle {
             bounds: treemap::Rect::default(),
             color: if is_dir {
-                egui::Color32::LIGHT_GREEN
+                egui::Color32::DARK_GREEN
             } else {
-                egui::Color32::LIGHT_GRAY
+                egui::Color32::DARK_GRAY
             },
             text: data
                 .get_filename(node)?
@@ -150,12 +150,13 @@ impl Treemap {
             } else {
                 self.rectangle_positions_valid = true;
                 TreemapLayout {}.layout_items(rectangles, egui_to_treemap(bounds));
-                dbg!(Ok(rectangles.as_slice()))
+                Ok(rectangles.as_slice())
             }
         } else {
             let mut rectangles = self.create_drawable_nodes()?;
             TreemapLayout {}.layout_items(&mut rectangles, egui_to_treemap(bounds));
             self.rectangles = Some(rectangles);
+            self.rectangle_positions_valid = true;
 
             Ok(self.rectangles.as_ref().unwrap().as_slice())
         }
@@ -203,7 +204,7 @@ impl Widget for &mut Treemap {
         }
 
         if let Some(new_directory) = new_directory {
-            self.set_directory(new_directory);
+            self.set_directory(new_directory).expect("Failed to set new directory!");
         }
 
         response
