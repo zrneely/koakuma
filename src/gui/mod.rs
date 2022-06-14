@@ -212,7 +212,12 @@ impl KoakumaApp {
 
     fn draw_analysis_finished_state(&mut self, ctx: &Context) {
         if let AppState::AnalysisFinished { ref mut map } = &mut self.state {
+            egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+                ui.label(map.get_current_status_text().unwrap_or_else(|| ""))
+            });
+
             egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label("Double click to navigate into a folder; right click to reveal that folder in Explorer");
                 ui.add(map);
             });
         }
@@ -267,6 +272,7 @@ fn sync_parse_drive_contents_helper<F>(
 where
     F: Fn(FilesystemAnalysisUpdate),
 {
+    let drive_letter = volume.paths.get(0).cloned().unwrap_or_default();
     let mut mft = mft::MasterFileTable::load(volume.get_handle()?, &volume.paths[0])?;
     let total_segments = mft.entry_count();
     progress_callback(FilesystemAnalysisUpdate::Update {
@@ -275,8 +281,11 @@ where
     });
 
     // Read entries in blocks of 500
-    let mut filesystem_data =
-        FilesystemDataBuilder::new(mft.bytes_per_cluster(), mft.entry_count() as usize);
+    let mut filesystem_data = FilesystemDataBuilder::new(
+        drive_letter,
+        mft.bytes_per_cluster(),
+        mft.entry_count() as usize,
+    );
     let mut reached_end = false;
     let mut total_processed = 0;
     while !reached_end && !cancel_flag.load(Ordering::SeqCst) {

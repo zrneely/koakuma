@@ -1,4 +1,7 @@
-use std::{collections::HashMap, ffi::OsString};
+use std::{
+    collections::{HashMap, VecDeque},
+    ffi::OsString,
+};
 
 use smallvec::SmallVec;
 
@@ -19,17 +22,23 @@ pub struct FilesystemDataBuilder {
     nodes: HashMap<u64, Node>,
     max_record_segment_index: u64,
     bytes_per_cluster: u64,
+    drive_letter: OsString,
 }
 impl FilesystemDataBuilder {
-    pub fn new(bytes_per_cluster: u64, size_hint: usize) -> Self {
+    pub fn new(drive_letter: OsString, bytes_per_cluster: u64, size_hint: usize) -> Self {
         FilesystemDataBuilder {
             nodes: HashMap::with_capacity(size_hint),
             max_record_segment_index: 0,
             bytes_per_cluster,
+            drive_letter,
         }
     }
 
     pub fn add_entry(&mut self, entry: MftEntry) {
+        if Self::should_exclude(&entry) {
+            return;
+        }
+
         let idx = entry.base_record_segment_idx;
         let size = entry.get_allocated_size(self.bytes_per_cluster, false);
         let node = Node {
@@ -43,6 +52,16 @@ impl FilesystemDataBuilder {
         self.nodes.insert(idx, node);
         if idx > self.max_record_segment_index {
             self.max_record_segment_index = idx;
+        }
+    }
+
+    fn should_exclude(entry: &MftEntry) -> bool {
+        // The first 24 files are special and some shouldn't be reported to the user.
+        // See https://flatcap.github.io/linux-ntfs/ntfs/files/index.html.
+        match entry.base_record_segment_idx {
+            8 => true, // $BadClus - lists known bad clusters; "allocated size" is not actually allocated
+            12..=23 => true, // Always unused
+            _ => false,
         }
     }
 
@@ -99,8 +118,8 @@ impl FilesystemDataBuilder {
         println!("Recursive sizes calculated");
 
         FilesystemData {
-            bytes_per_cluster: self.bytes_per_cluster,
             nodes: self.nodes,
+            drive_letter: self.drive_letter,
             root_idx,
         }
     }
@@ -108,8 +127,8 @@ impl FilesystemDataBuilder {
 
 pub struct FilesystemData {
     nodes: HashMap<u64, Node>,
-    bytes_per_cluster: u64,
     root_idx: u64,
+    drive_letter: OsString,
 }
 impl FilesystemData {
     pub fn get_root_node(&self) -> u64 {
@@ -134,6 +153,34 @@ impl FilesystemData {
             .get(0)
             .copied()
             .ok_or(Error::MissingParent)
+    }
+
+    pub fn get_full_path(&self, node: u64) -> Result<Option<OsString>, Error> {
+        let mut path_segments = VecDeque::new();
+        let mut cur_node = node;
+
+        loop {
+            match self.get_filename(cur_node)? {
+                Some(segment) => path_segments.push_front(segment),
+                None => return Ok(None),
+            }
+
+            let parent = self.get_parent(cur_node)?;
+
+            // don't include the root, to avoid paths like "C:\.\foo\bar"
+            if parent == self.root_idx {
+                let mut result = self.drive_letter.clone();
+                for (idx, segment) in path_segments.into_iter().enumerate() {
+                    if idx != 0 {
+                        result.push("\\");
+                    }
+                    result.push(segment);
+                }
+                return Ok(Some(result));
+            } else {
+                cur_node = parent;
+            }
+        }
     }
 
     pub fn get_filename(&self, node: u64) -> Result<Option<OsString>, Error> {

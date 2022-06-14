@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, sync::Arc};
 
-use egui::{Galley, Pos2, Rgba, TextStyle, Widget};
+use egui::{Color32, Galley, Pos2, Rgba, TextStyle, Widget};
 use humansize::{file_size_opts, FileSize};
 use treemap::{Mappable, TreemapLayout};
 
@@ -24,11 +24,19 @@ fn treemap_to_egui(inp: &treemap::Rect) -> egui::Rect {
     )
 }
 
+fn get_random_color(base_color: random_color::Color) -> Color32 {
+    let [r, g, b] = random_color::RandomColor::new()
+        .hue(base_color)
+        .to_rgb_array();
+    Color32::from_rgb(r, g, b)
+}
+
 #[derive(Debug)]
 struct DrawableRectangle {
     bounds: treemap::Rect,
     color: egui::Color32,
-    text: Option<String>,
+    text: Option<String>,        // file or dir name
+    full_path: Option<String>,
     size: u64,
     node: u64,
     is_dir: bool,
@@ -52,13 +60,16 @@ impl DrawableRectangle {
 
         Ok(DrawableRectangle {
             bounds: treemap::Rect::default(),
-            color: if is_dir {
-                egui::Color32::DARK_GREEN
+            color: get_random_color(if is_dir {
+                random_color::Color::Red
             } else {
-                egui::Color32::DARK_GRAY
-            },
+                random_color::Color::Green
+            }),
             text: data
                 .get_filename(node)?
+                .map(|str| str.to_string_lossy().to_string()),
+            full_path: data
+                .get_full_path(node)?
                 .map(|str| str.to_string_lossy().to_string()),
             size: data.get_allocated_size_recursive(node)?,
             node,
@@ -75,6 +86,7 @@ pub struct Treemap {
     rectangles: Option<Vec<DrawableRectangle>>,
     last_ui_bounds: Option<egui::Rect>,
     rectangle_positions_valid: bool,
+    current_hovered: Option<(String, usize)>, // text, idx
 }
 impl Treemap {
     pub fn new(data: FilesystemData) -> Self {
@@ -84,17 +96,20 @@ impl Treemap {
             rectangles: None,
             last_ui_bounds: None,
             rectangle_positions_valid: false,
+            current_hovered: None,
             data,
         }
     }
 
-    pub fn set_directory(&mut self, dir: u64) -> Result<(), Error> {
+    pub fn get_current_status_text(&self) -> Option<&str> {
+        self.current_hovered.as_ref().map(|(text, _)| text.as_str())
+    }
+
+    fn set_directory(&mut self, dir: u64) -> Result<(), Error> {
         self.current_dir = dir;
 
-        // invalidate both the current path and rectangles
-        self.current_path = None;
-        self.rectangles = None;
-        self.rectangle_positions_valid = false;
+        self.invalidate_rectangles();
+        self.invalidate_path();
 
         Ok(())
     }
@@ -103,7 +118,7 @@ impl Treemap {
         match self.last_ui_bounds {
             Some(ref mut last_bounds) if last_bounds != bounds => {
                 println!("Requesting relayout: {:?} => {:?}", last_bounds, bounds);
-                self.rectangle_positions_valid = false;
+                self.invalidate_rectangles();
                 self.last_ui_bounds = Some(bounds.clone());
             }
             None => {
@@ -112,6 +127,16 @@ impl Treemap {
 
             Some(_) => {}
         }
+    }
+
+    fn invalidate_rectangles(&mut self) {
+        self.rectangle_positions_valid = false;
+        self.current_hovered = None;
+    }
+
+    fn invalidate_path(&mut self) {
+        self.current_path = None;
+        self.rectangles = None;
     }
 
     fn get_current_path(&mut self) -> Result<&VecDeque<String>, Error> {
@@ -176,6 +201,19 @@ impl Treemap {
             None => Ok(Vec::new()),
         }
     }
+
+    fn get_status_text_for_item(&self, item: usize) -> String {
+        let item = &self.rectangles.as_ref().unwrap()[item];
+
+        if let Some(ref full_path) = item.full_path {
+            format!("{} ({})", full_path, item.size.file_size(file_size_opts::BINARY).unwrap())
+        } else {
+            format!(
+                "(could not get full path) ({})",
+                item.size.file_size(file_size_opts::BINARY).unwrap()
+            )
+        }
+    }
 }
 
 impl Widget for &mut Treemap {
@@ -184,6 +222,8 @@ impl Widget for &mut Treemap {
         let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::hover());
 
         let mut new_directory = None;
+        let mut item_to_open = None;
+        let mut hovered_item = None;
         {
             let items = match self.get_layout_items(&rect) {
                 Ok(items) => items,
@@ -193,18 +233,66 @@ impl Widget for &mut Treemap {
                 }
             };
 
-            for item in items.iter() {
+            for (idx, item) in items.iter().enumerate() {
                 let item_response = ui.put(treemap_to_egui(&item.bounds), rectangle(item));
 
-                if item.is_dir && item_response.clicked() {
+                if item_response.hovered() {
+                    hovered_item = Some(idx);
+                }
+
+                if item.is_dir && item_response.double_clicked() {
                     new_directory = Some(item.node);
                     response.mark_changed();
+                }
+
+                if item_response.clicked_by(egui::PointerButton::Secondary) {
+                    item_to_open = item.full_path.clone();
                 }
             }
         }
 
+        let mut updated_hover = None;
+        if let Some(new_hovered_item) = hovered_item {
+            if let Some((_, ref hovered_item)) = self.current_hovered {
+                // if we are currently hovering something, and something was hovered last frame,
+                // make sure they're the same
+                if new_hovered_item != *hovered_item {
+                    updated_hover = Some((
+                        self.get_status_text_for_item(new_hovered_item),
+                        new_hovered_item,
+                    ));
+                }
+            } else {
+                // if we are currently hovering something, and nothing was hovered last frame,
+                // update what we're currently hovering
+                updated_hover = Some((
+                    self.get_status_text_for_item(new_hovered_item),
+                    new_hovered_item,
+                ));
+            }
+        } else if self.current_hovered.is_some() {
+            // if we're not hovering anything, but last frame we were, clear the current hover state
+            self.current_hovered = None;
+            response.mark_changed();
+        } else {
+            // if we're not hovering anything, and last frame we weren't hovering anything, there is nothing to do
+        }
+
+        if let Some(item_to_open) = item_to_open {
+            let mut command = std::process::Command::new("explorer.exe");
+            // TODO: this doesn't work for paths with spaces
+            command.arg(format!("/select,{}", item_to_open));
+            command.spawn().unwrap();
+        }
+
+        if let Some(updated_hover) = updated_hover {
+            self.current_hovered = Some(updated_hover);
+            response.mark_changed();
+        }
+
         if let Some(new_directory) = new_directory {
-            self.set_directory(new_directory).expect("Failed to set new directory!");
+            self.set_directory(new_directory)
+                .expect("Failed to set new directory!");
         }
 
         response
