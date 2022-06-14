@@ -35,7 +35,7 @@ fn get_random_color(base_color: random_color::Color) -> Color32 {
 struct DrawableRectangle {
     bounds: treemap::Rect,
     color: egui::Color32,
-    text: Option<String>,        // file or dir name
+    text: Option<String>, // file or dir name
     full_path: Option<String>,
     size: u64,
     node: u64,
@@ -103,6 +103,11 @@ impl Treemap {
 
     pub fn get_current_status_text(&self) -> Option<&str> {
         self.current_hovered.as_ref().map(|(text, _)| text.as_str())
+    }
+
+    fn move_to_parent(&mut self) -> Result<(), Error> {
+        let parent = self.data.get_parent(self.current_dir)?;
+        self.set_directory(parent)
     }
 
     fn set_directory(&mut self, dir: u64) -> Result<(), Error> {
@@ -206,7 +211,11 @@ impl Treemap {
         let item = &self.rectangles.as_ref().unwrap()[item];
 
         if let Some(ref full_path) = item.full_path {
-            format!("{} ({})", full_path, item.size.file_size(file_size_opts::BINARY).unwrap())
+            format!(
+                "{} ({})",
+                full_path,
+                item.size.file_size(file_size_opts::BINARY).unwrap()
+            )
         } else {
             format!(
                 "(could not get full path) ({})",
@@ -224,6 +233,7 @@ impl Widget for &mut Treemap {
         let mut new_directory = None;
         let mut item_to_open = None;
         let mut hovered_item = None;
+        let mut should_move_up = false;
         {
             let items = match self.get_layout_items(&rect) {
                 Ok(items) => items,
@@ -245,8 +255,12 @@ impl Widget for &mut Treemap {
                     response.mark_changed();
                 }
 
-                if item_response.clicked_by(egui::PointerButton::Secondary) {
+                if item_response.clicked_by(egui::PointerButton::Middle) {
                     item_to_open = item.full_path.clone();
+                }
+
+                if item_response.clicked_by(egui::PointerButton::Secondary) {
+                    should_move_up = true;
                 }
             }
         }
@@ -293,6 +307,9 @@ impl Widget for &mut Treemap {
         if let Some(new_directory) = new_directory {
             self.set_directory(new_directory)
                 .expect("Failed to set new directory!");
+        } else if should_move_up {
+            self.move_to_parent()
+                .expect("Failed to move to parent directory!");
         }
 
         response

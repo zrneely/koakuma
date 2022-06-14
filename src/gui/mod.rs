@@ -217,7 +217,7 @@ impl KoakumaApp {
             });
 
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.label("Double click to navigate into a folder; right click to reveal that folder in Explorer");
+                ui.label("Double click to navigate into a folder; right click to move up one directory; middle click to reveal that folder in Explorer");
                 ui.add(map);
             });
         }
