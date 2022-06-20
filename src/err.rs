@@ -36,7 +36,6 @@ pub enum Error {
     AttributeListPointedToUnusedFileRecord,
     OperationCancelled,
     NoSuchNode,
-    MissingParent,
     TreeNavigatedToFile,
 }
 impl From<NulError> for Error {

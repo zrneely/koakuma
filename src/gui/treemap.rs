@@ -212,14 +212,16 @@ impl Treemap {
 
         if let Some(ref full_path) = item.full_path {
             format!(
-                "{} ({})",
+                "{} ({}) [{}]",
                 full_path,
-                item.size.file_size(file_size_opts::BINARY).unwrap()
+                item.size.file_size(file_size_opts::BINARY).unwrap(),
+                item.node,
             )
         } else {
             format!(
-                "(could not get full path) ({})",
-                item.size.file_size(file_size_opts::BINARY).unwrap()
+                "(could not get full path) ({}) [{}]",
+                item.size.file_size(file_size_opts::BINARY).unwrap(),
+                item.node,
             )
         }
     }

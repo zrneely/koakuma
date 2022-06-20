@@ -19,12 +19,14 @@ mod filesystem;
 mod task;
 mod treemap;
 
+#[derive(Debug)]
 enum FilesystemAnalysisUpdate {
     Finished(FilesystemData),
     Update {
         segments_processed: u64,
         total_segments: u64,
     },
+    ComputingSizes,
     Error(Error),
 }
 
@@ -40,11 +42,14 @@ enum AppState {
         selected_idx: usize,
         analyze_clicked: bool,
     },
-    AnalyzingDrive {
+    ReadingDrive {
         task: RunningTask<FilesystemAnalysisUpdate>,
         percent_complete: f32,
         total_entries: u64,
         processed_entries: u64,
+    },
+    ComputingSizes {
+        task: RunningTask<FilesystemAnalysisUpdate>,
     },
     AnalysisFinished {
         map: Treemap,
@@ -57,8 +62,8 @@ pub struct KoakumaApp {
 impl KoakumaApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        KoakumaApp {
-            state: KoakumaApp::create_volume_list_load_state(&cc.egui_ctx),
+        Self {
+            state: Self::create_volume_list_load_state(&cc.egui_ctx),
         }
     }
 }
@@ -68,7 +73,8 @@ impl App for KoakumaApp {
 
         self.draw_loading_volume_list_state(ctx);
         self.draw_selecting_volume_state(ctx);
-        self.draw_loading_analysis_state(ctx);
+        self.draw_reading_drive_state(ctx);
+        self.draw_computing_sizes_state(ctx);
         self.draw_analysis_finished_state(ctx);
     }
 }
@@ -79,7 +85,7 @@ impl KoakumaApp {
     }
 
     fn create_analyzing_drive_state(ctx: &Context, volume: VolumeInfo) -> AppState {
-        AppState::AnalyzingDrive {
+        AppState::ReadingDrive {
             task: task::spawn_task(ctx, move |cancel_flag, callback| {
                 sync_parse_drive_contents(&volume, cancel_flag, callback)
             }),
@@ -114,7 +120,7 @@ impl KoakumaApp {
                         Self::create_analyzing_drive_state(ctx, all_drives[selected_idx].clone());
                 }
             }
-            AppState::AnalyzingDrive {
+            AppState::ReadingDrive {
                 ref task,
                 ref mut percent_complete,
                 ref mut total_entries,
@@ -126,6 +132,9 @@ impl KoakumaApp {
                         map: Treemap::new(fs_data),
                     };
                 }
+                Some(FilesystemAnalysisUpdate::Error(Error::OperationCancelled)) => {
+                    self.state = Self::create_volume_list_load_state(ctx);
+                }
                 Some(FilesystemAnalysisUpdate::Error(err)) => todo!("handle error in fs analysis"),
                 Some(FilesystemAnalysisUpdate::Update {
                     segments_processed,
@@ -135,6 +144,19 @@ impl KoakumaApp {
                     *total_entries = total_segments;
                     *processed_entries = segments_processed;
                 }
+                Some(FilesystemAnalysisUpdate::ComputingSizes) => {
+                    self.state = AppState::ComputingSizes { task: task.clone() };
+                }
+                None => {}
+            },
+            AppState::ComputingSizes { ref mut task } => match task.get_most_recent_update() {
+                Some(FilesystemAnalysisUpdate::Finished(fs_data)) => {
+                    println!("Analysis finished!");
+                    self.state = AppState::AnalysisFinished {
+                        map: Treemap::new(fs_data),
+                    };
+                }
+                Some(other) => panic!("unexpected state transition to {:?}", other),
                 None => {}
             },
             AppState::AnalysisFinished { .. } => {}
@@ -178,8 +200,8 @@ impl KoakumaApp {
         }
     }
 
-    fn draw_loading_analysis_state(&mut self, ctx: &Context) {
-        if let AppState::AnalyzingDrive {
+    fn draw_reading_drive_state(&mut self, ctx: &Context) {
+        if let AppState::ReadingDrive {
             percent_complete,
             total_entries,
             processed_entries,
@@ -210,10 +232,26 @@ impl KoakumaApp {
         }
     }
 
+    fn draw_computing_sizes_state(&mut self, ctx: &Context) {
+        if let AppState::ComputingSizes { ref task } = self.state {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label("Computing folder sizes...");
+
+                ui.add_space(5.0);
+
+                let progress_bar = egui::ProgressBar::new(1.0 - f32::EPSILON)
+                    .animate(true);
+                ui.add(progress_bar);
+
+                ui.add_space(5.0);
+            });
+        }
+    }
+
     fn draw_analysis_finished_state(&mut self, ctx: &Context) {
         if let AppState::AnalysisFinished { ref mut map } = &mut self.state {
             egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-                ui.label(map.get_current_status_text().unwrap_or_else(|| ""))
+                ui.label(map.get_current_status_text().unwrap_or(""))
             });
 
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -308,12 +346,12 @@ where
         });
     }
 
-    let start = std::time::Instant::now();
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Err(Error::OperationCancelled);
+    }
+
+    progress_callback(FilesystemAnalysisUpdate::ComputingSizes);
     let filesystem_data = filesystem_data.finish();
-    println!(
-        "Populated children in {:?}",
-        std::time::Instant::now() - start
-    );
 
     if cancel_flag.load(Ordering::SeqCst) {
         Err(Error::OperationCancelled)

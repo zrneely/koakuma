@@ -12,6 +12,14 @@ pub struct RunningTask<T: Send + 'static> {
     progress: Arc<Mutex<Option<T>>>,
     cancel_flag: Arc<AtomicBool>,
 }
+impl<T: Send + 'static> Clone for RunningTask<T> {
+    fn clone(&self) -> Self {
+        Self {
+            progress: Arc::clone(&self.progress),
+            cancel_flag: Arc::clone(&self.cancel_flag),
+        }
+    }
+}
 impl<T: Send + 'static> RunningTask<T> {
     pub fn cancel(&self) {
         self.cancel_flag.store(true, Ordering::SeqCst);

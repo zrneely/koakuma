@@ -772,7 +772,6 @@ dependencies = [
  "humansize",
  "indicatif",
  "random_color",
- "smallvec",
  "treemap",
  "windows",
  "winres",
