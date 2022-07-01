@@ -251,7 +251,8 @@ impl KoakumaApp {
     fn draw_analysis_finished_state(&mut self, ctx: &Context) {
         if let AppState::AnalysisFinished { ref mut map } = &mut self.state {
             egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-                ui.label(map.get_current_status_text().unwrap_or(""))
+                let label = egui::Label::new(map.get_current_status_text().unwrap_or("")).wrap(false);
+                ui.add(label);
             });
 
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -278,7 +279,7 @@ fn sync_read_volume_list_helper(cancel_flag: Arc<AtomicBool>) -> Result<Vec<Volu
     for drive in iterator {
         result.push(drive?);
 
-        if cancel_flag.load(Ordering::SeqCst) {
+        if cancel_flag.load(Ordering::Relaxed) {
             return Err(Error::OperationCancelled);
         }
     }
@@ -326,7 +327,7 @@ where
     );
     let mut reached_end = false;
     let mut total_processed = 0;
-    while !reached_end && !cancel_flag.load(Ordering::SeqCst) {
+    while !reached_end && !cancel_flag.load(Ordering::Relaxed) {
         for _ in 0..500 {
             filesystem_data.add_entry(match mft.next() {
                 Some(val) => {
@@ -346,14 +347,14 @@ where
         });
     }
 
-    if cancel_flag.load(Ordering::SeqCst) {
+    if cancel_flag.load(Ordering::Relaxed) {
         return Err(Error::OperationCancelled);
     }
 
     progress_callback(FilesystemAnalysisUpdate::ComputingSizes);
     let filesystem_data = filesystem_data.finish();
 
-    if cancel_flag.load(Ordering::SeqCst) {
+    if cancel_flag.load(Ordering::Relaxed) {
         Err(Error::OperationCancelled)
     } else {
         Ok(filesystem_data)

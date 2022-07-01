@@ -22,7 +22,7 @@ impl<T: Send + 'static> Clone for RunningTask<T> {
 }
 impl<T: Send + 'static> RunningTask<T> {
     pub fn cancel(&self) {
-        self.cancel_flag.store(true, Ordering::SeqCst);
+        self.cancel_flag.store(true, Ordering::Relaxed);
     }
 
     /// Returns None if there is no update since the last time asked
