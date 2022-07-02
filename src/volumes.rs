@@ -87,7 +87,9 @@ impl Display for VolumeInfo {
         )?;
 
         match self.name {
-            Ok(ref volume_name) if volume_name.len() > 0 => write!(f, " ({})", volume_name.to_string_lossy())?,
+            Ok(ref volume_name) if volume_name.len() > 0 => {
+                write!(f, " ({})", volume_name.to_string_lossy())?
+            }
             _ => {}
         }
 
@@ -167,10 +169,13 @@ impl Iterator for VolumeIterator {
                     self.get_paths_for_volume(&name)
                         .map(|paths| VolumeInfo::new(name, paths))
                 })),
-                Err(err) => match err.win32_error() {
-                    Some(ERROR_NO_MORE_FILES) => None,
-                    _ => Some(Err(Error::FindNextVolumeFailed(err))),
-                },
+                Err(err) => {
+                    if err.code() == ERROR_NO_MORE_FILES.to_hresult() {
+                        None
+                    } else {
+                        Some(Err(Error::FindNextVolumeFailed(err)))
+                    }
+                }
             }
         }
     }

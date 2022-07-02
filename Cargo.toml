@@ -28,7 +28,7 @@ clap = { version = "3", optional=true }
 indicatif = { version = "0.16", optional=true }
 
 [dependencies.windows]
-version = "0.37"
+version = "0.38"
 features = [
     "alloc",
     "Win32_Foundation",

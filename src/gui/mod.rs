@@ -242,8 +242,6 @@ impl KoakumaApp {
                 let progress_bar = egui::ProgressBar::new(1.0 - f32::EPSILON)
                     .animate(true);
                 ui.add(progress_bar);
-
-                ui.add_space(5.0);
             });
         }
     }
