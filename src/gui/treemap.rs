@@ -38,12 +38,17 @@ struct DrawableRectangle {
     text: Option<String>, // file or dir name
     full_path: Option<String>,
     size: u64,
-    node: u64,
+    file_count: u64,
+    node_idx: u64,
     is_dir: bool,
+    mode: TreemapMode,
 }
 impl Mappable for DrawableRectangle {
     fn size(&self) -> f64 {
-        self.size as f64
+        match self.mode {
+            TreemapMode::BySize => self.size as f64,
+            TreemapMode::ByChildCount => self.file_count as f64,
+        }
     }
 
     fn bounds(&self) -> &treemap::Rect {
@@ -55,8 +60,9 @@ impl Mappable for DrawableRectangle {
     }
 }
 impl DrawableRectangle {
-    fn new(node: u64, data: &FilesystemData) -> Result<Self, Error> {
-        let is_dir = data.get_children(node)?.is_some();
+    fn new(node_idx: u64, data: &FilesystemData, mode: TreemapMode) -> Result<Self, Error> {
+        let node = data.get_node(node_idx)?;
+        let is_dir = node.has_children();
 
         Ok(DrawableRectangle {
             bounds: treemap::Rect::default(),
@@ -65,17 +71,25 @@ impl DrawableRectangle {
             } else {
                 random_color::Color::Green
             }),
-            text: data
-                .get_filename(node)?
+            text: node
+                .get_filename()
                 .map(|str| str.to_string_lossy().to_string()),
             full_path: data
-                .get_full_path(node)?
+                .get_full_path(node_idx)?
                 .map(|str| str.to_string_lossy().to_string()),
-            size: data.get_allocated_size_recursive(node)?,
-            node,
+            size: node.get_allocated_size_recursive(),
+            file_count: node.get_recursive_file_count(),
+            node_idx,
             is_dir,
+            mode,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TreemapMode {
+    BySize,
+    ByChildCount,
 }
 
 pub struct Treemap {
@@ -87,9 +101,10 @@ pub struct Treemap {
     last_ui_bounds: Option<egui::Rect>,
     rectangle_positions_valid: bool,
     current_hovered: Option<(String, usize)>, // text, idx
+    mode: TreemapMode,
 }
 impl Treemap {
-    pub fn new(data: FilesystemData) -> Self {
+    pub fn new(data: FilesystemData, mode: TreemapMode) -> Self {
         Treemap {
             current_path: None,
             current_dir: data.get_root_node(),
@@ -98,6 +113,7 @@ impl Treemap {
             rectangle_positions_valid: false,
             current_hovered: None,
             data,
+            mode,
         }
     }
 
@@ -105,8 +121,16 @@ impl Treemap {
         self.current_hovered.as_ref().map(|(text, _)| text.as_str())
     }
 
+    pub fn set_mode(&mut self, mode: TreemapMode) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.invalidate_rectangles();
+            self.invalidate_path();
+        }
+    }
+
     fn move_to_parent(&mut self) -> Result<(), Error> {
-        let parent = self.data.get_parent(self.current_dir)?;
+        let parent = self.data.get_node(self.current_dir)?.get_parent();
         self.set_directory(parent)
     }
 
@@ -124,10 +148,10 @@ impl Treemap {
             Some(ref mut last_bounds) if last_bounds != bounds => {
                 println!("Requesting relayout: {:?} => {:?}", last_bounds, bounds);
                 self.invalidate_rectangles();
-                self.last_ui_bounds = Some(bounds.clone());
+                self.last_ui_bounds = Some(*bounds);
             }
             None => {
-                self.last_ui_bounds = Some(bounds.clone());
+                self.last_ui_bounds = Some(*bounds);
             }
 
             Some(_) => {}
@@ -146,19 +170,14 @@ impl Treemap {
 
     fn get_current_path(&mut self) -> Result<&VecDeque<String>, Error> {
         if let Some(ref current_path) = self.current_path {
-            Ok(&current_path)
+            Ok(current_path)
         } else {
             let mut new_path = VecDeque::new();
             let mut current_node = self.current_dir;
             loop {
-                new_path.push_front(
-                    self.data
-                        .get_filename(current_node)?
-                        .unwrap()
-                        .to_string_lossy()
-                        .to_string(),
-                );
-                let parent = self.data.get_parent(current_node)?;
+                let node = self.data.get_node(current_node)?;
+                new_path.push_front(node.get_filename().unwrap().to_string_lossy().to_string());
+                let parent = node.get_parent();
                 if parent == current_node {
                     break;
                 }
@@ -167,7 +186,7 @@ impl Treemap {
 
             self.current_path = Some(new_path);
 
-            Ok(&self.current_path.as_ref().unwrap())
+            Ok(self.current_path.as_ref().unwrap())
         }
     }
 
@@ -193,15 +212,15 @@ impl Treemap {
     }
 
     fn create_drawable_nodes(&self) -> Result<Vec<DrawableRectangle>, Error> {
-        match self.data.get_children(self.current_dir)? {
+        match self.data.get_node(self.current_dir)?.get_children() {
             Some(children) => children
                 .filter(|node| {
                     self.data
-                        .get_allocated_size_recursive(*node)
-                        .map(|size| size > 0)
+                        .get_node(*node)
+                        .map(|node| node.get_allocated_size_recursive() > 0)
                         .unwrap_or(false)
                 })
-                .map(|child_idx| DrawableRectangle::new(child_idx, &self.data))
+                .map(|child_idx| DrawableRectangle::new(child_idx, &self.data, self.mode))
                 .collect(),
             None => Ok(Vec::new()),
         }
@@ -211,17 +230,27 @@ impl Treemap {
         let item = &self.rectangles.as_ref().unwrap()[item];
 
         if let Some(ref full_path) = item.full_path {
-            format!(
-                "{} ({}) [{}]",
-                full_path,
-                item.size.file_size(file_size_opts::BINARY).unwrap(),
-                item.node,
-            )
+            if item.file_count > 0 {
+                format!(
+                    "{} ({}) {{{} children}} [{}]",
+                    full_path,
+                    item.size.file_size(file_size_opts::BINARY).unwrap(),
+                    item.file_count,
+                    item.node_idx,
+                )
+            } else {
+                format!(
+                    "{} ({}) [{}]",
+                    full_path,
+                    item.size.file_size(file_size_opts::BINARY).unwrap(),
+                    item.node_idx,
+                )
+            }
         } else {
             format!(
                 "(could not get full path) ({}) [{}]",
                 item.size.file_size(file_size_opts::BINARY).unwrap(),
-                item.node,
+                item.node_idx,
             )
         }
     }
@@ -253,7 +282,7 @@ impl Widget for &mut Treemap {
                 }
 
                 if item.is_dir && item_response.double_clicked() {
-                    new_directory = Some(item.node);
+                    new_directory = Some(item.node_idx);
                     response.mark_changed();
                 }
 
@@ -342,7 +371,7 @@ fn rectangle_ui(ui: &mut egui::Ui, rect_data: &DrawableRectangle) -> egui::Respo
 
     let mut center = rect.center();
     let align_bottom = |galley: &Arc<Galley>, center: &mut Pos2, spacing: f32| {
-        let mut position = center.clone();
+        let mut position = *center;
         let size = galley.size();
         position.x -= size.x / 2.0;
         position.y -= size.y / 2.0;
@@ -369,11 +398,14 @@ fn rectangle_ui(ui: &mut egui::Ui, rect_data: &DrawableRectangle) -> egui::Respo
             center = previous_center;
         }
 
-        let text = (rect_data.size as u64)
-            .file_size(file_size_opts::BINARY)
-            .unwrap();
+        let size_text = match rect_data.mode {
+            TreemapMode::BySize => (rect_data.size as u64)
+                .file_size(file_size_opts::BINARY)
+                .unwrap(),
+            TreemapMode::ByChildCount => format!("{} children", rect_data.file_count),
+        };
         let galley = painter.layout_no_wrap(
-            text,
+            size_text,
             TextStyle::Small.resolve(ui.style()),
             Rgba::BLACK.into(),
         );

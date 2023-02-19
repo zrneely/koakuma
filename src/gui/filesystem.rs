@@ -6,12 +6,46 @@ use std::{
 use crate::{err::Error, mft::MftEntry};
 
 #[derive(Debug)]
-struct Node {
+pub struct Node {
     filename: Option<OsString>,
     self_size: u64,
     children_indices: Vec<u64>,
     recursive_size: u64,
+    recursive_child_count: u64,
     parent_index: u64,
+}
+impl Node {
+    pub fn get_children(&self) -> Option<impl Iterator<Item = u64> + '_> {
+        if self.children_indices.is_empty() {
+            None
+        } else {
+            Some(FilesystemChildrenIterator { node: self, idx: 0 })
+        }
+    }
+
+    pub fn has_children(&self) -> bool {
+        !self.children_indices.is_empty()
+    }
+
+    pub fn get_parent(&self) -> u64 {
+        self.parent_index
+    }
+
+    pub fn get_filename(&self) -> Option<OsString> {
+        self.filename.clone()
+    }
+
+    pub fn get_allocated_size(&self) -> u64 {
+        self.self_size
+    }
+
+    pub fn get_allocated_size_recursive(&self) -> u64 {
+        self.recursive_size
+    }
+
+    pub fn get_recursive_file_count(&self) -> u64 {
+        self.recursive_child_count
+    }
 }
 
 pub struct FilesystemDataBuilder {
@@ -41,6 +75,7 @@ impl FilesystemDataBuilder {
             filename: entry.get_best_filename(),
             self_size: size,
             recursive_size: size,
+            recursive_child_count: 0,
             children_indices: Vec::new(),
             // The vast majority of files and directories have only one
             // parent, but they could have more than one if they are hardlinked
@@ -58,13 +93,11 @@ impl FilesystemDataBuilder {
     }
 
     fn should_exclude(entry: &MftEntry) -> bool {
-        // The first 24 files are special and some shouldn't be reported to the user.
+        // Some "files" are special and some shouldn't be reported to the user.
         // See https://flatcap.github.io/linux-ntfs/ntfs/files/index.html.
-        match entry.base_record_segment_idx {
-            8 => true, // $BadClus - lists known bad clusters; "allocated size" is not actually allocated
-            12..=23 => true, // Always unused
-            _ => false,
-        }
+        // File 8 is $BadClus, which is a list of known bad sectors; its "allocated size" is not actually allocated.
+        // Files 12 - 23 are always unused.
+        matches!(entry.base_record_segment_idx, 8 | 12..=23)
     }
 
     /// Call this after all entries are added
@@ -89,7 +122,7 @@ impl FilesystemDataBuilder {
         let root_idx = root_idx.expect("drive has no root");
         println!("Child pointers populated");
 
-        // Pass 2: compute recursive size
+        // Pass 2: compute recursive size and file coutn
         for idx in (0u64..).take(self.max_record_segment_index as usize) {
             let mut next_parent;
             let node_self_size = if let Some(node) = self.nodes.get(&idx) {
@@ -104,6 +137,7 @@ impl FilesystemDataBuilder {
             loop {
                 if let Some(parent) = self.nodes.get_mut(&next_parent) {
                     parent.recursive_size = parent.recursive_size.saturating_add(node_self_size);
+                    parent.recursive_child_count += 1;
 
                     // Also add it to that node's parents
                     if next_parent != root_idx {
@@ -136,34 +170,22 @@ impl FilesystemData {
         self.root_idx
     }
 
-    pub fn get_children<'a>(
-        &'a self,
-        node: u64,
-    ) -> Result<Option<impl Iterator<Item = u64> + 'a>, Error> {
-        let node = self.nodes.get(&node).ok_or(Error::NoSuchNode)?;
-        Ok(if node.children_indices.is_empty() {
-            None
-        } else {
-            Some(FilesystemChildrenIterator { node, idx: 0 })
-        })
-    }
-
-    pub fn get_parent(&self, node: u64) -> Result<u64, Error> {
-        let node = self.nodes.get(&node).ok_or(Error::NoSuchNode)?;
-        Ok(node.parent_index)
+    pub fn get_node(&self, node: u64) -> Result<&Node, Error> {
+        self.nodes.get(&node).ok_or(Error::NoSuchNode)
     }
 
     pub fn get_full_path(&self, node: u64) -> Result<Option<OsString>, Error> {
         let mut path_segments = VecDeque::new();
-        let mut cur_node = node;
+        let mut cur_node_idx = node;
 
         loop {
-            match self.get_filename(cur_node)? {
+            let cur_node = self.get_node(cur_node_idx)?;
+            match cur_node.get_filename() {
                 Some(segment) => path_segments.push_front(segment),
                 None => return Ok(None),
             }
 
-            let parent = self.get_parent(cur_node)?;
+            let parent = cur_node.get_parent();
 
             // don't include the root, to avoid paths like "C:\.\foo\bar"
             if parent == self.root_idx {
@@ -176,24 +198,9 @@ impl FilesystemData {
                 }
                 return Ok(Some(result));
             } else {
-                cur_node = parent;
+                cur_node_idx = parent;
             }
         }
-    }
-
-    pub fn get_filename(&self, node: u64) -> Result<Option<OsString>, Error> {
-        let node = self.nodes.get(&node).ok_or(Error::NoSuchNode)?;
-        Ok(node.filename.clone())
-    }
-
-    pub fn get_allocated_size(&self, node: u64) -> Result<u64, Error> {
-        let node = self.nodes.get(&node).ok_or(Error::NoSuchNode)?;
-        Ok(node.self_size)
-    }
-
-    pub fn get_allocated_size_recursive(&self, node: u64) -> Result<u64, Error> {
-        let node = self.nodes.get(&node).ok_or(Error::NoSuchNode)?;
-        Ok(node.recursive_size)
     }
 }
 

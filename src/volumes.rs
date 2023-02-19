@@ -54,7 +54,7 @@ impl VolumeInfo {
             )
         }
         .map(|handle| SafeHandle { handle })
-        .map_err(|err| Error::OpenVolumeHandleFailed(err))
+        .map_err(Error::OpenVolumeHandleFailed)
     }
 
     fn get_volume_name(unc_name: &OsString) -> Result<OsString, Error> {
@@ -71,7 +71,7 @@ impl VolumeInfo {
             )
             .ok()
         }
-        .map_err(|err| Error::GetVolumeNameFailed(err))
+        .map_err(Error::GetVolumeNameFailed)
         .and_then(|_| parse_buffer(&buffer[..]))
     }
 }
@@ -129,7 +129,7 @@ impl VolumeIterator {
             )
             .ok()
         }
-        .map_err(|err| Error::GetVolumePathNamesFailed(err))?;
+        .map_err(Error::GetVolumePathNamesFailed)?;
 
         Self::parse_string_list(&self.buffer[..])
     }

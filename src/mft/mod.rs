@@ -61,7 +61,7 @@ impl MftEntry {
         self.filename.first().map(|e| e.filename.clone())
     }
 
-    pub fn parents<'a>(&'a self) -> impl Iterator<Item = u64> + 'a {
+    pub fn parents(&self) -> impl Iterator<Item = u64> + '_ {
         MftEntryParentIterator {
             entry: self,
             idx: 0,
@@ -613,7 +613,7 @@ fn get_ntfs_volume_data(
         )
         .ok()
     }
-    .map_err(|err| Error::GetNtfsVolumeDataFailed(err))?;
+    .map_err(Error::GetNtfsVolumeDataFailed)?;
 
     if result_size != (buf.len() as u32) * 8 {
         return Err(Error::GetNtfsVolumeDataBadSize);
@@ -655,7 +655,7 @@ fn get_mft_handle(volume_path: &OsStr) -> Result<SafeHandle, Error> {
         )
     }
     .map(|handle| SafeHandle { handle })
-    .map_err(|err| Error::OpenMftFailed(err))
+    .map_err(Error::OpenMftFailed)
 }
 
 fn parse_runlist_unsigned_int(data: &[u8], width: u8) -> u64 {

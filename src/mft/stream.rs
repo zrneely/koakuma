@@ -157,7 +157,7 @@ impl MftStream {
                     )
                     .ok()
                 }
-                .map_err(|err| Error::ReadVolumeFailed(err))?;
+                .map_err(Error::ReadVolumeFailed)?;
 
                 let num_bytes_read: usize = num_bytes_read.try_into().unwrap();
                 if num_bytes_read != self.buffer.len() {
@@ -182,7 +182,7 @@ impl MftStream {
                 )
                 .ok()
             }
-            .map_err(|err| Error::ReadVolumeFailed(err))?;
+            .map_err(Error::ReadVolumeFailed)?;
 
             let num_bytes_read: usize = num_bytes_read.try_into().unwrap();
             if num_bytes_read != buf.len() {
@@ -217,7 +217,7 @@ fn load_file_extents(handle: &SafeHandle) -> Result<Vec<Extent>, Error> {
             )
             .ok()
         }
-        .map_err(|err| Error::GetRetrievalPointersFailed(err))?;
+        .map_err(Error::GetRetrievalPointersFailed)?;
 
         let mut returned_buffer = &retrieval_buffer[..result_size as usize];
 

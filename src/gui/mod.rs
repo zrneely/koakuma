@@ -4,11 +4,11 @@ use std::sync::{
 };
 
 use eframe::{App, Frame};
-use egui::Context;
+use egui::{Context, Key};
 
 use crate::{
     err::Error,
-    gui::filesystem::FilesystemDataBuilder,
+    gui::{filesystem::FilesystemDataBuilder, treemap::TreemapMode},
     mft,
     volumes::{VolumeInfo, VolumeIterator},
 };
@@ -129,7 +129,7 @@ impl KoakumaApp {
                 Some(FilesystemAnalysisUpdate::Finished(fs_data)) => {
                     println!("Analysis finished!");
                     self.state = AppState::AnalysisFinished {
-                        map: Treemap::new(fs_data),
+                        map: Treemap::new(fs_data, TreemapMode::BySize),
                     };
                 }
                 Some(FilesystemAnalysisUpdate::Error(Error::OperationCancelled)) => {
@@ -153,7 +153,7 @@ impl KoakumaApp {
                 Some(FilesystemAnalysisUpdate::Finished(fs_data)) => {
                     println!("Analysis finished!");
                     self.state = AppState::AnalysisFinished {
-                        map: Treemap::new(fs_data),
+                        map: Treemap::new(fs_data, TreemapMode::BySize),
                     };
                 }
                 Some(other) => panic!("unexpected state transition to {:?}", other),
@@ -233,14 +233,13 @@ impl KoakumaApp {
     }
 
     fn draw_computing_sizes_state(&mut self, ctx: &Context) {
-        if let AppState::ComputingSizes { ref task } = self.state {
+        if let AppState::ComputingSizes { .. } = self.state {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.label("Computing folder sizes...");
 
                 ui.add_space(5.0);
 
-                let progress_bar = egui::ProgressBar::new(1.0 - f32::EPSILON)
-                    .animate(true);
+                let progress_bar = egui::ProgressBar::new(1.0 - f32::EPSILON).animate(true);
                 ui.add(progress_bar);
             });
         }
@@ -248,8 +247,17 @@ impl KoakumaApp {
 
     fn draw_analysis_finished_state(&mut self, ctx: &Context) {
         if let AppState::AnalysisFinished { ref mut map } = &mut self.state {
+            if ctx.input().key_released(Key::S) {
+                map.set_mode(TreemapMode::BySize);
+            }
+
+            if ctx.input().key_released(Key::C) {
+                map.set_mode(TreemapMode::ByChildCount);
+            }
+
             egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-                let label = egui::Label::new(map.get_current_status_text().unwrap_or("")).wrap(false);
+                let label =
+                    egui::Label::new(map.get_current_status_text().unwrap_or("")).wrap(false);
                 ui.add(label);
             });
 

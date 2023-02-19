@@ -11,7 +11,7 @@ gui = ["egui", "eframe", "winres", "treemap", "humansize", "random_color"]
 default = ["gui"]
 
 [profile.release]
-# lto = true
+lto = true
 # debug = true
 
 [build-dependencies]
